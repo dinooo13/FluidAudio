@@ -212,14 +212,11 @@ struct ChunkProcessor {
     }
 
     /// One step of `silenceAlignedChunkStarts`: the start of the window whose
-    /// nominal position is `target`, given the previous window's start.
-    ///
-    /// Every sample this reads lies at or below
+    /// nominal position is `target`, given the previous window's start. The
+    /// search is clipped to `totalSamples` and reads no sample above
     /// `previousStart + chunkSamples - minimumOverlapSamples + frameSamples`,
-    /// so a caller that already has the previous window's audio can run it
-    /// without the rest of the recording — that is what lets
-    /// `IncrementalChunkProcessor` lay windows out one at a time and still
-    /// land on the starts `process` would have chosen.
+    /// so a caller holding that much audio gets the start `process` would pick
+    /// without the rest of the recording.
     func nextSilenceAlignedStart(
         after previousStart: Int,
         target: Int,
@@ -479,11 +476,7 @@ struct ChunkProcessor {
     /// What `process`'s loop body works out for a single window before it
     /// hands the samples to the encoder.
     struct WindowPlan: Sendable {
-        let chunkIndex: Int
         let chunkStart: Int
-        /// Real audio decoded ahead of `chunkStart` whose tokens are suppressed.
-        let warmupSamples: Int
-        /// Mel/STFT context the decoder skips (the PR #264 prepend).
         let contextSamples: Int
         let contextStart: Int
         let chunkEnd: Int
@@ -491,15 +484,12 @@ struct ChunkProcessor {
         let chunkStartOffset: Int
         let emitTokensAfterFrame: Int?
         let isLastChunk: Bool
-        /// `chunkEnd` a non-last window would have, i.e. the amount of audio
-        /// that has to exist before this window can run without being the last.
-        let visibleChunkSamples: Int
     }
 
-    /// The per-window plan lifted out of `process`'s loop so the incremental
-    /// path lays its windows out with the same rules rather than a copy of
-    /// them. Returns nil exactly where that loop would `break`: an empty
-    /// window, or a final window whose audio is pure silence.
+    /// The per-window layout lifted out of `process`'s loop so another caller
+    /// can lay windows out by the same rules. Returns nil exactly where that
+    /// loop would `break`: an empty window, or a final window whose audio is
+    /// pure silence.
     func planWindow(
         chunkIndex: Int,
         chunkStart: Int,
@@ -554,65 +544,15 @@ struct ChunkProcessor {
             warmupSamples > 0 ? chunkStart / ASRConstants.samplesPerEncoderFrame : nil
 
         return WindowPlan(
-            chunkIndex: chunkIndex,
             chunkStart: chunkStart,
-            warmupSamples: warmupSamples,
             contextSamples: contextSamples,
             contextStart: contextStart,
             chunkEnd: chunkEnd,
             audioEnd: audioEnd,
             chunkStartOffset: warmupSamples > 0 ? contextStart : chunkStart,
             emitTokensAfterFrame: emitTokensAfterFrame,
-            isLastChunk: isLastChunk,
-            visibleChunkSamples: visibleChunkSamples
+            isLastChunk: isLastChunk
         )
-    }
-
-    /// One window through the encoder and decoder, from a fresh decoder
-    /// state. The body of `process`'s task group, shared with the
-    /// incremental path.
-    static func runWindow(
-        samples: [Float],
-        plan: WindowPlan,
-        using manager: AsrManager,
-        decoderLayers: Int,
-        maxModelSamples: Int,
-        language: Language?
-    ) async throws -> [TokenWindow] {
-        var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
-        decoderState.reset()
-
-        let (windowTokens, windowTimestamps, windowConfidences, windowDurations) =
-            try await Self
-            .transcribeChunk(
-                samples: samples,
-                contextSamples: plan.contextSamples,
-                chunkStart: plan.chunkStartOffset,
-                isLastChunk: plan.isLastChunk,
-                using: manager,
-                decoderState: &decoderState,
-                maxModelSamples: maxModelSamples,
-                language: language,
-                emitTokensAfterFrame: plan.emitTokensAfterFrame,
-                initialTimeIndexOverride: plan.emitTokensAfterFrame == nil ? nil : 0
-            )
-
-        guard
-            windowTokens.count == windowTimestamps.count
-                && windowTokens.count == windowConfidences.count
-        else {
-            throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
-        }
-
-        let durations =
-            windowDurations.count == windowTokens.count
-            ? windowDurations : Array(repeating: 0, count: windowTokens.count)
-
-        return zip(
-            zip(zip(windowTokens, windowTimestamps), windowConfidences), durations
-        ).map {
-            (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
-        }
     }
 
     func process(
@@ -716,14 +656,41 @@ struct ChunkProcessor {
                 chunkOutputs.append(nil)
 
                 group.addTask {
-                    let windowData = try await Self.runWindow(
-                        samples: chunkSamplesArray,
-                        plan: plan,
-                        using: worker,
-                        decoderLayers: decoderLayers,
-                        maxModelSamples: maxModelSamples,
-                        language: language
-                    )
+                    var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
+                    decoderState.reset()
+
+                    let (windowTokens, windowTimestamps, windowConfidences, windowDurations) =
+                        try await Self
+                        .transcribeChunk(
+                            samples: chunkSamplesArray,
+                            contextSamples: plan.contextSamples,
+                            chunkStart: plan.chunkStartOffset,
+                            isLastChunk: isLastChunk,
+                            using: worker,
+                            decoderState: &decoderState,
+                            maxModelSamples: maxModelSamples,
+                            language: language,
+                            emitTokensAfterFrame: plan.emitTokensAfterFrame,
+                            initialTimeIndexOverride: plan.emitTokensAfterFrame == nil ? nil : 0
+                        )
+
+                    guard
+                        windowTokens.count == windowTimestamps.count
+                            && windowTokens.count == windowConfidences.count
+                    else {
+                        throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
+                    }
+
+                    let durations =
+                        windowDurations.count == windowTokens.count
+                        ? windowDurations : Array(repeating: 0, count: windowTokens.count)
+
+                    let windowData: [TokenWindow] = zip(
+                        zip(zip(windowTokens, windowTimestamps), windowConfidences), durations
+                    ).map {
+                        (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
+                    }
+
                     return TaskResult(index: index, tokens: windowData, workerIndex: workerIndex)
                 }
                 inFlight += 1
@@ -762,7 +729,6 @@ struct ChunkProcessor {
         return try await finalize(
             chunkOutputs: orderedChunkOutputs,
             using: manager,
-            repairWorker: workers[0],
             decoderLayers: decoderLayers,
             maxModelSamples: maxModelSamples,
             language: language,
@@ -772,14 +738,12 @@ struct ChunkProcessor {
 
     /// Everything `process` does once every window has returned: the pairwise
     /// merge, the monotonic-timestamp clamp, the seam duplicate collapse, the
-    /// seam-gap repair pass, and `processTranscriptionResult`.
-    /// `IncrementalChunkProcessor.finish()` calls this with the same windows
-    /// in the same order, which is what makes the two paths produce the same
-    /// text.
+    /// seam-gap repair pass, and `processTranscriptionResult`. Shared so that
+    /// any caller handing over the same windows in the same order gets the
+    /// same text.
     func finalize(
         chunkOutputs orderedChunkOutputs: [[TokenWindow]],
         using manager: AsrManager,
-        repairWorker: AsrManager,
         decoderLayers: Int,
         maxModelSamples: Int,
         language: Language?,
@@ -837,7 +801,7 @@ struct ChunkProcessor {
 
             mergedTokens = try await repairSeamGaps(
                 in: mergedTokens,
-                using: repairWorker,
+                using: manager,
                 decoderLayers: decoderLayers,
                 maxModelSamples: maxModelSamples,
                 minGapSeconds: minGapSeconds,
