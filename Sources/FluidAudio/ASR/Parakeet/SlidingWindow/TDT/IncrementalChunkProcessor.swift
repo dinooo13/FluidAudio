@@ -319,6 +319,15 @@ public actor IncrementalChunkProcessor {
             // `regularChunkStarts` is just the nominal grid.
             return remember(ChunkProcessor.ChunkStartDecision(start: target, useWarmupPrefix: false))
         }
+        // The silence search reads forward of `target`, as far as the latest
+        // start that still overlaps the previous window, plus one frame for the
+        // energy window around the candidate. Deciding before that much audio
+        // exists would search a truncated signal and settle on a start `process`
+        // would not have chosen, and `remember` then freezes it. Waiting costs
+        // nothing: the window cannot run until a further `chunkSamples` arrives.
+        let searchLimit =
+            previousStart + layout.chunkSamples - 5 * ASRConstants.samplesPerEncoderFrame
+        guard isFinal || chunker.totalSamples >= searchLimit else { return nil }
         return remember(
             try chunker.nextSilenceAlignedStart(
                 after: previousStart,
