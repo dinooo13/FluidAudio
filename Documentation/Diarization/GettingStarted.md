@@ -191,6 +191,8 @@ let diarizer = DiarizerManager(config: config)
 
 > Requires macOS 14 / iOS 17 or later. The offline stack uses native C++ clustering and AsyncStream coordination that are unavailable on older OS releases.
 
+> **Known OS issue — macOS 14 can crash in BNNS.** macOS 14 (all patch levels through at least 14.8.7) carries an Apple bug that crashes Core ML predictions on the BNNS CPU path (`EXC_BAD_ACCESS` in `libBNNS`, `BNNSGraphContextExecute_v2` → `_platform_memmove`). With models routed to `.cpuAndNeuralEngine`, the [#878](https://github.com/FluidInference/FluidAudio/issues/878) CI matrix reproduced it 1200/1200 on macOS 14 runners and 0/N on macOS 15 and 26 (see also [#661](https://github.com/FluidInference/FluidAudio/issues/661)). Serialized pipelines and single-model runs crash just the same. On machines without a Neural Engine (VMs, CI runners) the crash is deterministic; on Apple Silicon it is intermittent, striking when predictions fall back from the ANE to BNNS. Only `.cpuAndNeuralEngine` was matrix-tested. The reporter's harness notes that GPU-enabled routing (`.all`, the default) stops reproduction, but that has not been verified as a mitigation and the FBank model stays on CPU regardless of configuration. Apple fixed the bug in macOS 15; updating the OS is the confirmed remedy. `OfflineDiarizerManager` logs a warning when initialized on an affected build. (This is a distinct bug from the macOS/iOS 26.4–26.5 BNNS crash documented for Kokoro TTS in [KokoroAne.md](../TTS/KokoroAne.md).)
+
 When you need full parity with the pyannote/Core ML exporter (powerset segmentation + VBx clustering), use `OfflineDiarizerManager`. It orchestrates segmentation, soft mask interpolation, WeSpeaker embedding extraction, PLDA/VBx clustering, and timeline reconstruction in one place:
 
 ```swift
@@ -266,6 +268,18 @@ The offline controller mirrors the reference pipeline:
 - `vbx`: Max iterations and convergence tolerance for the refinement loop.
 - `postProcessing`: Minimum gap duration when stitching segments back together.
 - `export`: Optional `embeddingsPath` for dumping per-speaker vectors to JSON.
+
+#### Why VBx has no transition (self-loop) prior
+
+BUT's original VBx runs an HMM over one time-ordered sequence of x-vectors, and its `loopProb` (the probability of staying with the current speaker) is the knob for "how readily may the speaker change". This pipeline deliberately has no such prior, and none is exposed on `OfflineDiarizerConfig.VBx`. That is pyannote parity, not an omission in the port: pyannote's `utils/vbx.py` replaces the forward-backward pass with a per-frame GMM update (its own comment reads `# use GMM update`), and `VBxClustering` mirrors it.
+
+The reason is the observation sequence. VBx here refines clusters over *per-chunk speaker embeddings*, and a chunk with overlapping speech yields several embeddings for the same time span. An HMM over that flattened array would read simultaneous speakers as rapid speaker switches. So the VB step only decides *which* speakers exist and *which embedding belongs to which*; temporal structure is left to the segmentation model.
+
+Consequences for tuning ([#879](https://github.com/FluidInference/FluidAudio/issues/879)):
+
+- `clustering.warmStartFa` / `warmStartFb` scale the evidence in the ELBO. They change how many clusters survive, not how often the speaker may change; a sweep can move the speaker count from 9 to 22 while leaving DER and turn alternation bit-identical.
+- Turn-taking sensitivity lives in segmentation. A smaller `segmentation.stepRatio` (denser windows) and a lower `minSegmentDurationSeconds` recover short turns that a coarser step absorbs into their neighbours, at the cost of more segments. On far-field meetings with rapid exchanges, `stepRatio 0.1` is the setting that has measured best for alternation.
+- Adding a transition prior would mean diverging from the pyannote recipe and building a temporally meaningful observation sequence that handles overlapping local tracks first. It is not planned.
 
 `prepareModels` captures Core ML compilation timings (and download durations when a fresh fetch is needed), so `DiarizationResult.timings` reflects audio loading, segmentation, embedding, clustering, and post-processing costs in one place. Per-speaker embeddings are exposed in `speakerDatabase` for downstream analytics without toggling debug flags.
 

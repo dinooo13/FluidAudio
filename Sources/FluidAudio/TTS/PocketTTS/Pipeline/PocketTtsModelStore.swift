@@ -19,6 +19,10 @@ public actor PocketTtsModelStore {
     private var flowDecoderModel: MLModel?
     private var mimiDecoderModel: MLModel?
     private var mimiEncoderModel: MLModel?
+    /// True when `mimiEncoderModel` is the pack-local per-language encoder
+    /// (`mimi_encoderv3.mlmodelc`), whose output is already in the pack's own
+    /// conditioning space — no host-side reprojection needed (#793).
+    private var mimiEncoderIsPackLocal = false
     private var speakerProjectionCache: PocketTtsVoiceCloner.SpeakerProjection?
     /// `.aneState` only: the prefill/generate function instances loaded from
     /// the `pocket_state.mlmodelc` multifunction package (mobius Trial 23).
@@ -34,6 +38,7 @@ public actor PocketTtsModelStore {
     public let language: PocketTtsLanguage
     public let precision: PocketTtsPrecision
     public let placement: PocketTtsModelPlacement
+    public let computeUnits: PocketTtsComputeUnits
 
     /// - Parameters:
     ///   - language: Which upstream language pack to load. Defaults to
@@ -51,16 +56,21 @@ public actor PocketTtsModelStore {
     ///   ignores `precision` for the FlowLM (fp16 only). `.aneState` loads
     ///   the Trial 23 `pocket_state.mlmodelc` multifunction package (MLState
     ///   KV cache; macOS 15+/iOS 18+ at runtime, fp16 only).
+    /// - Parameter computeUnits: Per-stage compute-unit overrides (#881).
+    ///   `.default` keeps the measured-fastest routing below; set a stage, or
+    ///   use `.avoidNeuralEngine`, on hardware where the ANE rejects one.
     public init(
         language: PocketTtsLanguage = .english,
         directory: URL? = nil,
         precision: PocketTtsPrecision = .fp16,
-        placement: PocketTtsModelPlacement = .gpu
+        placement: PocketTtsModelPlacement = .gpu,
+        computeUnits: PocketTtsComputeUnits = .default
     ) {
         self.language = language
         self.directory = directory
         self.precision = precision
         self.placement = placement
+        self.computeUnits = computeUnits
     }
 
     /// Load all four CoreML models and the constants bundle.
@@ -121,10 +131,13 @@ public actor PocketTtsModelStore {
         // M-series — the trade buys a GPU-free decode loop). cond_prefill_ane
         // is 92% ANE-capable but its single fat T=256 call is ~2x faster on
         // GPU, so it stays `.all` and lets the scheduler pick.
-        let condConfig = config(.all)
-        let flowlmConfig = config(placement == .ane ? .cpuAndNeuralEngine : .all)
-        let flowDecoderConfig = config(.all)
-        let mimiConfig = config(.cpuOnly)
+        // Callers can override any stage (#881: M1 Max / macOS 26.6 aborts
+        // `flow_decoder_fused` on the ANE, and no placement avoids `.all`).
+        let units = computeUnits.resolved(for: placement)
+        let condConfig = config(units.conditioner)
+        let flowlmConfig = config(units.flowLM)
+        let flowDecoderConfig = config(units.flowDecoder)
+        let mimiConfig = config(units.mimiDecoder)
 
         let loadStart = Date()
 
@@ -151,7 +164,7 @@ public actor PocketTtsModelStore {
             let modelURL = languageRoot.appendingPathComponent(spec.file)
             let model = try MLModel(contentsOf: modelURL, configuration: spec.config)
             loadedModels.append(model)
-            logger.info("Loaded \(spec.file) (computeUnits=\(spec.config.computeUnits.rawValue))")
+            logger.info("Loaded \(spec.file) (computeUnits=\(spec.config.computeUnits.pocketTtsLabel))")
         }
 
         // In v2.1 the conditioner IS cond_prefill (no per-token cond_step).
@@ -220,9 +233,10 @@ public actor PocketTtsModelStore {
         let stateURL = languageRoot.appendingPathComponent(
             ModelNames.PocketTTS.pocketStateFile)
 
+        let stateUnits = computeUnits.resolvedStatePipeline
         func functionConfig(_ functionName: String) -> MLModelConfiguration {
             let c = MLModelConfiguration()
-            c.computeUnits = .cpuAndNeuralEngine
+            c.computeUnits = stateUnits
             c.functionName = functionName
             return c
         }
@@ -235,16 +249,17 @@ public actor PocketTtsModelStore {
             configuration: functionConfig(ModelNames.PocketTTS.StateFunction.generate))
         stateModelsStore = PocketTtsStateModels(prefill: prefill, generate: generate)
         logger.info(
-            "Loaded \(ModelNames.PocketTTS.pocketStateFile) (functions: prefill, generate; computeUnits=cpuAndNeuralEngine)"
+            "Loaded \(ModelNames.PocketTTS.pocketStateFile) (functions: prefill, generate; computeUnits=\(stateUnits.pocketTtsLabel))"
         )
 
         let mimiConfig = MLModelConfiguration()
-        mimiConfig.computeUnits = .cpuOnly
+        mimiConfig.computeUnits = computeUnits.mimiDecoder ?? .cpuOnly
         let mimiURL = languageRoot.appendingPathComponent(ModelNames.PocketTTS.mimiDecoderFile)
         let mimi = try MLModel(contentsOf: mimiURL, configuration: mimiConfig)
         mimiDecoderModel = mimi
         mimiDecoderKeysCache = try PocketTtsMimiKeys.discover(from: mimi)
-        logger.info("Loaded \(ModelNames.PocketTTS.mimiDecoderFile) (computeUnits=cpuOnly)")
+        logger.info(
+            "Loaded \(ModelNames.PocketTTS.mimiDecoderFile) (computeUnits=\(mimiConfig.computeUnits.pocketTtsLabel))")
 
         let elapsed = Date().timeIntervalSince(loadStart)
         logger.info("PocketTTS state-pipeline models loaded in \(String(format: "%.2f", elapsed))s")
@@ -379,21 +394,38 @@ public actor PocketTtsModelStore {
 
     /// Load the Mimi encoder model for voice cloning (lazy, on-demand).
     ///
-    /// Downloads the model from HuggingFace if not already cached. The Mimi
-    /// encoder is language-agnostic and lives at the repo root, shared
-    /// across all language packs.
+    /// Downloads the model from HuggingFace if not already cached. Every
+    /// language pack ships its own mimi codec weights, so non-English packs
+    /// prefer the pack-local `mimi_encoderv3.mlmodelc` (that pack's mimi +
+    /// speaker projection baked in). The shared root `mimi_encoderv2` (English
+    /// mimi) is English's encoder and the fallback when the pack-local one is
+    /// unavailable — cloning then goes through the legacy reprojection path,
+    /// which places the voice only approximately (#793).
     public func loadMimiEncoderIfNeeded() async throws {
         guard mimiEncoderModel == nil else { return }
 
-        // Ensure the mimi_encoder is downloaded (downloads if needed)
-        let modelURL = try await PocketTtsResourceDownloader.ensureMimiEncoder(directory: directory)
-
         let config = MLModelConfiguration()
-        config.computeUnits = .cpuAndGPU
+        config.computeUnits = computeUnits.resolvedMimiEncoder
+
+        if language != .english,
+            let packURL = try await PocketTtsResourceDownloader.ensurePackMimiEncoder(
+                language: language, directory: directory)
+        {
+            logger.info("Loading pack-local Mimi encoder (\(self.language.rawValue))...")
+            let loadStart = Date()
+            mimiEncoderModel = try MLModel(contentsOf: packURL, configuration: config)
+            mimiEncoderIsPackLocal = true
+            let elapsed = Date().timeIntervalSince(loadStart)
+            logger.info("Mimi encoder loaded in \(String(format: "%.2f", elapsed))s")
+            return
+        }
+
+        let modelURL = try await PocketTtsResourceDownloader.ensureMimiEncoder(directory: directory)
 
         logger.info("Loading Mimi encoder for voice cloning...")
         let loadStart = Date()
         mimiEncoderModel = try MLModel(contentsOf: modelURL, configuration: config)
+        mimiEncoderIsPackLocal = false
         let elapsed = Date().timeIntervalSince(loadStart)
         logger.info("Mimi encoder loaded in \(String(format: "%.2f", elapsed))s")
     }
@@ -408,11 +440,16 @@ public actor PocketTtsModelStore {
         return model
     }
 
-    /// Check if the Mimi encoder model is available.
+    /// Check if a Mimi encoder model is available (pack-local per-language
+    /// encoder inside the language root, or the shared root encoder).
     public func isMimiEncoderAvailable() -> Bool {
-        // The Mimi encoder lives at the repo root, two levels above any
-        // `v2/<lang>/` language root.
         guard let langRoot = languageRootDirectory else { return false }
+        let packURL = langRoot.appendingPathComponent(ModelNames.PocketTTS.mimiEncoderV3File)
+        if FileManager.default.fileExists(atPath: packURL.path) {
+            return true
+        }
+        // The shared root encoder lives two levels above any `v2.1/<lang>/`
+        // language root.
         let repoRoot = langRoot.deletingLastPathComponent().deletingLastPathComponent()
         let modelURL = repoRoot.appendingPathComponent(ModelNames.PocketTTS.mimiEncoderFile)
         return FileManager.default.fileExists(atPath: modelURL.path)
@@ -422,14 +459,22 @@ public actor PocketTtsModelStore {
     public func cloneVoice(from audioURL: URL) throws -> PocketTtsVoiceData {
         let encoder = try mimiEncoder()
         return try PocketTtsVoiceCloner.cloneVoice(
-            from: audioURL, using: encoder, projection: loadSpeakerProjection())
+            from: audioURL, using: encoder, projection: cloneProjection())
     }
 
     /// Clone a voice from audio samples within the actor's isolation context.
     public func cloneVoice(from samples: [Float]) throws -> PocketTtsVoiceData {
         let encoder = try mimiEncoder()
         return try PocketTtsVoiceCloner.cloneVoice(
-            from: samples, using: encoder, projection: loadSpeakerProjection())
+            from: samples, using: encoder, projection: cloneProjection())
+    }
+
+    /// Projection to apply to freshly-encoded clone conditioning. The
+    /// pack-local per-language encoder already emits conditioning in the
+    /// pack's own space, so no reprojection is applied; the legacy shared
+    /// (English) encoder needs the #793 reprojection assets.
+    private func cloneProjection() -> PocketTtsVoiceCloner.SpeakerProjection? {
+        mimiEncoderIsPackLocal ? nil : loadSpeakerProjection()
     }
 
     /// Load (and cache) the per-language speaker projection used to re-project
@@ -460,17 +505,19 @@ public actor PocketTtsModelStore {
         guard let pinv = loadFloatBin(pinvURL, expectedCount: expected),
             let proj = loadFloatBin(projURL, expectedCount: expected)
         else {
-            // 6-layer non-English packs can't clone reliably even with the
-            // projection — the upstream pocket-tts flow LM early-EOSes on the
-            // encoded voice conditioning (confirmed against the PyTorch
-            // reference, #793). Steer callers to the 24-layer variant, which
-            // works. Other missing-asset cases are a transient fetch gap.
+            // This fallback only runs when the pack-local per-language
+            // encoder (`mimi_encoderv3`) is unavailable. The legacy shared
+            // (English-mimi) encoder + reprojection cannot clone reliably for
+            // 6-layer non-English packs — the flow LM early-EOSes on the
+            // wrong-codec conditioning (#793). Other missing-asset cases are
+            // a transient fetch gap.
             if language.transformerLayers == 6 && language != .english {
                 logger.warning(
-                    "PocketTTS live voice cloning is not supported for the \(self.language.rawValue) "
-                        + "(6-layer) pack — the upstream model produces garbled/truncated output "
-                        + "for cloned voices. Use the 24-layer variant (\(self.language.rawValue)_24l) "
-                        + "for voice cloning (#793).")
+                    "PocketTTS live voice cloning for the \(self.language.rawValue) (6-layer) pack "
+                        + "requires the pack-local \(ModelNames.PocketTTS.mimiEncoderV3File), which "
+                        + "is unavailable — the shared-encoder fallback produces garbled/truncated "
+                        + "output for this pack. Retry once the encoder can be downloaded, or use "
+                        + "the 24-layer variant (\(self.language.rawValue)_24l) (#793).")
             } else if language != .english {
                 logger.warning(
                     "PocketTTS speaker projection assets missing for \(self.language.rawValue) "

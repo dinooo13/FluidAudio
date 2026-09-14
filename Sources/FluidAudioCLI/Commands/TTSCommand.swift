@@ -70,8 +70,7 @@ public struct TTS {
         var text: String? = nil
         // KokoroAne: treat the positional/`--text` value as a pre-computed
         // phoneme string (IPA for en/ja, Bopomofo+tone for zh) and bypass
-        // G2P via synthesizeFromPhonemes. Required for `.japanese`, which
-        // ships no text frontend (issue #698).
+        // G2P via synthesizeFromPhonemes.
         var treatAsPhonemes = false
         var deEss = true
         var backend: TtsBackend = .kokoroAne
@@ -80,6 +79,8 @@ public struct TTS {
         var saveVoicePath: String? = nil
         var pocketLanguage: PocketTtsLanguage = .english
         var pocketPlacement: PocketTtsModelPlacement = .gpu
+        var pocketComputeUnits: PocketTtsComputeUnits = .default
+        var pocketTemperature: Float = PocketTtsConstants.temperature
         // PocketTTS deterministic-seed mode (uses session API for fixed RNG).
         var pocketSeed: UInt64? = nil
         // StyleTTS2 zero-shot args.
@@ -107,6 +108,7 @@ public struct TTS {
         var luxttsSeed: UInt64 = LuxTtsConstants.defaultSeed
         var neuttsSeed: UInt64 = 1234
         var neuttsEmotion = NeuTtsConstants.defaultEmotion
+        var chatterboxSeed: UInt64 = 42
 
         var i = 0
         while i < arguments.count {
@@ -180,6 +182,10 @@ public struct TTS {
                     case "inflect-nano":
                         backend = .inflect
                         inflectVariant = .nano
+                    case "chatterbox", "chatterbox-mtl", "chatterbox-multilingual":
+                        backend = .chatterbox
+                    case "chatterbox-nano":
+                        backend = .chatterboxNano
                     default:
                         logger.warning("Unknown backend '\(arguments[i + 1])'; using kokoro-ane")
                     }
@@ -228,6 +234,11 @@ public struct TTS {
                     luxttsPromptText = arguments[i + 1]
                     i += 1
                 }
+            case "--temperature":
+                if i + 1 < arguments.count, let v = Float(arguments[i + 1]) {
+                    pocketTemperature = v
+                    i += 1
+                }
             case "--silence":
                 if i + 1 < arguments.count, let v = Float(arguments[i + 1]) {
                     supertonicSilence = v
@@ -259,6 +270,7 @@ public struct TTS {
                     pocketSeed = parsed
                     luxttsSeed = parsed
                     neuttsSeed = parsed
+                    chatterboxSeed = parsed
                     i += 1
                 }
             case "--emotion":
@@ -292,6 +304,23 @@ public struct TTS {
             case "--save-voice":
                 if i + 1 < arguments.count {
                     saveVoicePath = arguments[i + 1]
+                    i += 1
+                }
+            case "--compute-units":
+                if i + 1 < arguments.count {
+                    switch arguments[i + 1].lowercased() {
+                    case "default": pocketComputeUnits = .default
+                    case "no-ane", "avoid-ane": pocketComputeUnits = .avoidNeuralEngine
+                    case "all": pocketComputeUnits = .uniform(.all)
+                    case "cpu-gpu", "gpu": pocketComputeUnits = .uniform(.cpuAndGPU)
+                    case "cpu-ane", "ane": pocketComputeUnits = .uniform(.cpuAndNeuralEngine)
+                    case "cpu-only", "cpu": pocketComputeUnits = .uniform(.cpuOnly)
+                    default:
+                        logger.error(
+                            "Unknown --compute-units '\(arguments[i + 1])'. Supported: default, no-ane, all, cpu-gpu, cpu-ane, cpu-only"
+                        )
+                        return
+                    }
                     i += 1
                 }
             case "--placement":
@@ -345,7 +374,8 @@ public struct TTS {
                 metricsPath: metricsPath, cloneVoicePath: cloneVoicePath,
                 voiceFilePath: voiceFilePath, saveVoicePath: saveVoicePath,
                 language: pocketLanguage, seed: pocketSeed,
-                placement: pocketPlacement)
+                placement: pocketPlacement, computeUnits: pocketComputeUnits,
+                temperature: pocketTemperature)
         case .kokoroAne:
             await runKokoroAne(
                 text: text, output: output, voice: voice, metricsPath: metricsPath,
@@ -387,6 +417,14 @@ public struct TTS {
                 variant: inflectVariant, treatAsPhonemes: treatAsPhonemes,
                 seed: pocketSeed ?? 0,
                 metricsPath: metricsPath, cpuOnly: cpuOnly)
+        case .chatterbox:
+            await runChatterbox(
+                text: text, output: output, language: supertonicLanguage,
+                seed: chatterboxSeed, metricsPath: metricsPath)
+        case .chatterboxNano:
+            await runChatterboxNano(
+                text: text, output: output,
+                seed: chatterboxSeed, metricsPath: metricsPath)
         }
     }
 
@@ -638,11 +676,13 @@ public struct TTS {
         voice: String,
         voiceData: PocketTtsVoiceData?,
         seed: UInt64,
-        deEss: Bool
+        deEss: Bool,
+        temperature: Float
     ) async throws -> Data {
         logger.info("PocketTTS deterministic mode: seed=\(seed)")
         let session = try await makePocketSeededSession(
-            manager: manager, voice: voice, voiceData: voiceData, seed: seed)
+            manager: manager, voice: voice, voiceData: voiceData, seed: seed,
+            temperature: temperature)
         session.enqueue(text)
         session.finish()
         var allSamples: [Float] = []
@@ -668,17 +708,18 @@ public struct TTS {
         manager: PocketTtsManager,
         voice: String,
         voiceData: PocketTtsVoiceData?,
-        seed: UInt64
+        seed: UInt64,
+        temperature: Float
     ) async throws -> PocketTtsSession {
         if let voiceData = voiceData {
             return try await manager.makeSession(
                 voiceData: voiceData,
-                temperature: PocketTtsConstants.temperature,
+                temperature: temperature,
                 seed: seed)
         }
         return try await manager.makeSession(
             voice: voice,
-            temperature: PocketTtsConstants.temperature,
+            temperature: temperature,
             seed: seed)
     }
 
@@ -688,7 +729,9 @@ public struct TTS {
         voiceFilePath: String?, saveVoicePath: String?,
         language: PocketTtsLanguage,
         seed: UInt64? = nil,
-        placement: PocketTtsModelPlacement = .gpu
+        placement: PocketTtsModelPlacement = .gpu,
+        computeUnits: PocketTtsComputeUnits = .default,
+        temperature: Float = PocketTtsConstants.temperature
     ) async {
         do {
             let tStart = Date()
@@ -696,7 +739,8 @@ public struct TTS {
                 voice == TtsConstants.recommendedVoice
                 ? PocketTtsConstants.defaultVoice : voice
             let manager = PocketTtsManager(
-                defaultVoice: pocketVoice, language: language, placement: placement)
+                defaultVoice: pocketVoice, language: language, placement: placement,
+                computeUnits: computeUnits)
             logger.info(
                 "PocketTTS language: \(language.rawValue), placement: \(placement.rawValue)")
 
@@ -734,13 +778,14 @@ public struct TTS {
                     voice: pocketVoice,
                     voiceData: voiceData,
                     seed: seed,
-                    deEss: deEss)
+                    deEss: deEss,
+                    temperature: temperature)
             } else if let voiceData = voiceData {
                 wav = try await manager.synthesize(
-                    text: text, voiceData: voiceData, deEss: deEss)
+                    text: text, voiceData: voiceData, temperature: temperature, deEss: deEss)
             } else {
                 wav = try await manager.synthesize(
-                    text: text, voice: pocketVoice, deEss: deEss)
+                    text: text, voice: pocketVoice, temperature: temperature, deEss: deEss)
             }
             let tSynth1 = Date()
 
@@ -867,22 +912,22 @@ public struct TTS {
             let tLoad1 = Date()
 
             let tSynth0 = Date()
-            // synthesizeDetailed handles English (G2PModel) and Mandarin
-            // (MandarinG2P, with pass-through for pre-computed Bopomofo).
-            // With --phonemes, or for Japanese (no text frontend), bypass
-            // G2P and feed the input as a pre-computed phoneme string.
+            // synthesizeDetailed handles all three text frontends. With
+            // --phonemes, bypass G2P and feed a pre-computed phoneme string.
             let detailed: KokoroAneSynthesisResult
-            if treatAsPhonemes || variant == .japanese {
+            if treatAsPhonemes {
                 detailed = try await manager.synthesizeFromPhonemesDetailed(
                     text, voice: resolvedVoice, speed: 1.0)
             } else {
                 detailed = try await manager.synthesizeDetailed(
                     text: text, voice: resolvedVoice, speed: 1.0)
             }
+            // Native level for all variants — matches the PyTorch reference
+            // now that KokoroTail_v2 carries the COLA-corrected iSTFT (#852).
             let wav = try AudioWAV.data(
                 from: detailed.samples,
                 sampleRate: Double(detailed.sampleRate),
-                normalize: variant != .japanese)
+                normalize: false)
             let tSynth1 = Date()
 
             let outURL = resolveInputURL(output)
@@ -1308,6 +1353,154 @@ public struct TTS {
         }
     }
 
+    /// Run Chatterbox Multilingual TTS (built-in voice; `--lang` picks the
+    /// language, `--seed` the sampling seed).
+    private static func runChatterbox(
+        text: String, output: String, language: String,
+        seed: UInt64, metricsPath: String?
+    ) async {
+        guard #available(macOS 15.0, *) else {
+            logger.error("Chatterbox requires macOS 15+ (MLState KV cache)")
+            exit(1)
+        }
+        do {
+            let tStart = Date()
+            let manager = ChatterboxManager()
+            let tLoad0 = Date()
+            try await manager.initialize()
+            let tLoad1 = Date()
+            logger.info("Chatterbox language=\(language) seed=\(seed)")
+
+            let tSynth0 = Date()
+            let audio = try await manager.synthesize(
+                text: text, language: language, seed: seed)
+            let tSynth1 = Date()
+
+            let outURL = resolveInputURL(output)
+            try FileManager.default.createDirectory(
+                at: outURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            let wav = try AudioWAV.data(
+                from: audio.samples, sampleRate: Double(audio.sampleRate))
+            try wav.write(to: outURL)
+
+            let loadS = tLoad1.timeIntervalSince(tLoad0)
+            let synthS = tSynth1.timeIntervalSince(tSynth0)
+            let totalS = tSynth1.timeIntervalSince(tStart)
+            let audioSecs = Double(audio.samples.count) / Double(audio.sampleRate)
+            let rtfx = synthS > 0 ? audioSecs / synthS : 0
+
+            logger.info("Chatterbox synthesis complete")
+            logger.info("  Load: \(String(format: "%.3f", loadS))s")
+            logger.info("  Synthesis: \(String(format: "%.3f", synthS))s")
+            logger.info("  Audio: \(String(format: "%.3f", audioSecs))s")
+            logger.info("  RTFx: \(String(format: "%.2f", rtfx))x")
+            logger.info("  Output: \(outURL.path)")
+
+            if let metricsPath {
+                let metricsDict: [String: Any] = [
+                    "backend": "chatterbox",
+                    "text": text,
+                    "language": language,
+                    "seed": seed,
+                    "output": outURL.path,
+                    "model_load_time_s": loadS,
+                    "inference_time_s": synthS,
+                    "audio_duration_s": audioSecs,
+                    "realtime_speed": rtfx,
+                    "total_time_s": totalS,
+                ]
+                let artifactsRoot = try ensureArtifactsRoot()
+                let mURL = resolveOutputURL(
+                    metricsPath, artifactsRoot: artifactsRoot, expectsDirectory: false)
+                try FileManager.default.createDirectory(
+                    at: mURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true)
+                let json = try JSONSerialization.data(
+                    withJSONObject: metricsDict, options: [.prettyPrinted])
+                try json.write(to: mURL)
+                logger.info("Metrics saved: \(mURL.path)")
+            }
+        } catch {
+            logger.error("Chatterbox Error: \(error)")
+            print("Chatterbox failed: \(error)")
+            exit(1)
+        }
+    }
+
+    /// Run Chatterbox Nano TTS (English, built-in voice, paralinguistic tags
+    /// inline in the text; `--seed` picks the sampling seed).
+    private static func runChatterboxNano(
+        text: String, output: String,
+        seed: UInt64, metricsPath: String?
+    ) async {
+        guard #available(macOS 15.0, *) else {
+            logger.error("Chatterbox Nano requires macOS 15+ (MLState KV cache)")
+            exit(1)
+        }
+        do {
+            let tStart = Date()
+            let manager = ChatterboxNanoManager()
+            let tLoad0 = Date()
+            try await manager.initialize()
+            let tLoad1 = Date()
+            logger.info("Chatterbox Nano seed=\(seed)")
+
+            let tSynth0 = Date()
+            let audio = try await manager.synthesize(text: text, seed: seed)
+            let tSynth1 = Date()
+
+            let outURL = resolveInputURL(output)
+            try FileManager.default.createDirectory(
+                at: outURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            let wav = try AudioWAV.data(
+                from: audio.samples, sampleRate: Double(audio.sampleRate))
+            try wav.write(to: outURL)
+
+            let loadS = tLoad1.timeIntervalSince(tLoad0)
+            let synthS = tSynth1.timeIntervalSince(tSynth0)
+            let totalS = tSynth1.timeIntervalSince(tStart)
+            let audioSecs = Double(audio.samples.count) / Double(audio.sampleRate)
+            let rtfx = synthS > 0 ? audioSecs / synthS : 0
+
+            logger.info("Chatterbox Nano synthesis complete")
+            logger.info("  Load: \(String(format: "%.3f", loadS))s")
+            logger.info("  Synthesis: \(String(format: "%.3f", synthS))s")
+            logger.info("  Audio: \(String(format: "%.3f", audioSecs))s")
+            logger.info("  RTFx: \(String(format: "%.2f", rtfx))x")
+            logger.info("  Output: \(outURL.path)")
+
+            if let metricsPath {
+                let metricsDict: [String: Any] = [
+                    "backend": "chatterbox-nano",
+                    "text": text,
+                    "seed": seed,
+                    "output": outURL.path,
+                    "model_load_time_s": loadS,
+                    "inference_time_s": synthS,
+                    "audio_duration_s": audioSecs,
+                    "realtime_speed": rtfx,
+                    "total_time_s": totalS,
+                ]
+                let artifactsRoot = try ensureArtifactsRoot()
+                let mURL = resolveOutputURL(
+                    metricsPath, artifactsRoot: artifactsRoot, expectsDirectory: false)
+                try FileManager.default.createDirectory(
+                    at: mURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true)
+                let json = try JSONSerialization.data(
+                    withJSONObject: metricsDict, options: [.prettyPrinted])
+                try json.write(to: mURL)
+                logger.info("Metrics saved: \(mURL.path)")
+            }
+        } catch {
+            logger.error("Chatterbox Nano Error: \(error)")
+            print("Chatterbox Nano failed: \(error)")
+            exit(1)
+        }
+    }
+
     private static func printUsage() {
         print(
             """
@@ -1317,7 +1510,14 @@ public struct TTS {
               --output, -o         Output WAV path (default: output.wav)
               --voice, -v          Voice name (default: af_heart for KokoroAne, alba for PocketTTS)
               --backend            TTS backend: kokoro-ane (default), pocket, styletts2,
-                                   supertonic3, luxtts, neutts (beta), inflect (beta)
+                                   supertonic3, luxtts, neutts (beta), inflect (beta),
+                                   chatterbox (beta, multilingual, macOS 15+),
+                                   chatterbox-nano (beta, English + [laugh]/[chuckle] tags, macOS 15+)
+                                   Chatterbox (built-in voice, 18 languages):
+                                     --lang de                  language code (default en)
+                                     --seed N                   sampling seed (default 42)
+                                   Chatterbox Nano (built-in voice, English):
+                                     --seed N                   sampling seed (default 42)
                                    StyleTTS2 (zero-shot, English):
                                      --reference <speaker.wav>  required
                                      --alpha 0.3                ref-side blend (default 0.3)
@@ -1371,6 +1571,9 @@ public struct TTS {
                                    portuguese, portuguese_24l, spanish, spanish_24l
                                    Note: French is 24-layer only (no 6-layer pack upstream)
               --seed N             Deterministic-mode seed (uses session API for fixed RNG)
+              --temperature T      Generation temperature (default 0.7)
+              --compute-units U    PocketTTS per-stage routing: default, no-ane (keep every
+                                   stage off the Neural Engine, #881), all, cpu-gpu, cpu-ane, cpu-only
               --placement P        Model placement: gpu (default), ane (rank-4 ANE models),
                                    ane-state (Trial 23 MLState multifunction pipeline;
                                    macOS 15+/iOS 18+, requires pocket_state.mlmodelc)

@@ -35,8 +35,8 @@ Want to convert your own model? Check [möbius](https://github.com/FluidInferenc
 ## Highlights
 
 - **Automatic Speech Recognition (ASR)**: [Parakeet TDT v3](Documentation/Models.md#batch-transcription-near-real-time) (0.6b) and other TDT/CTC models for batch transcription supporting 25 European languages and Japanese, plus SenseVoice and Paraformer for Mandarin Chinese; [Parakeet EOU](Documentation/Models.md#streaming-transcription-true-real-time) (120m) for streaming ASR with end-of-utterance detection (English only). See all [ASR models](Documentation/Models.md#asr-models).
-- **Inverse Text Normalization (ITN)**: Post-process ASR output to convert spoken-form to written-form ("two hundred" → "200"). See [text-processing-rs](https://github.com/FluidInference/text-processing-rs)
-- **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (EN, DE, ES, FR, IT, PT — 6L and 24L variants)
+- **Inverse Text Normalization (ITN)**: Post-process ASR output to convert spoken-form to written-form ("two hundred" → "200"). See [text-processing-rs](https://github.com/FluidInference/text-processing-rs). Optional: ASR-only apps can drop the engine (~8 MB per slice) with `traits: []` (Swift 6.2+), see [PostProcessing.md](Documentation/ASR/PostProcessing.md#opting-out-of-the-engine)
+- **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (EN, DE, ES, FR, IT, PT — 6L and 24L variants); Chatterbox Multilingual (520M, 18 languages) and Chatterbox Nano (110M, English with `[laugh]`/`[chuckle]` paralinguistic tags) in beta — see [Documentation/TTS/Chatterbox.md](Documentation/TTS/Chatterbox.md)
 - **Speaker Diarization (Online + Offline)**: Speaker separation and identification across audio streams. Streaming pipeline for real-time processing and offline batch pipeline with advanced clustering.
 - **Speaker Embedding Extraction**: Generate speaker embeddings for voice comparison and clustering, you can use this for speaker identification
 - **Voice Activity Detection (VAD)**: Voice activity detection with Silero models
@@ -108,6 +108,7 @@ Make a PR if you want to add your app, please keep it in chronological order.
 | **[Better Voice](https://voice.baselinemakes.com)** | — | macOS menu-bar app for on-device dictation and meeting notes that save to Apple Notes. Everything runs locally. Uses speaker diarization. |
 | **[Logue](https://github.com/bitwize-ai/Logue)** | ✓ | Privacy-first AI meeting notes and writing assistant for macOS. Records mic + system audio and transcribes locally on Apple Silicon, with speaker diarization, Smart Minutes, and an on-device AI writing editor — nothing leaves the Mac. Uses FluidAudio streaming Sortformer speaker diarization. |
 | **[Goodmeet](https://goodmeet.com/)** | — | The AI note-taker that puts your privacy first. Uses FluidAudio models for VAD and transcription. |
+| **[Subtitles](https://subtitles-live.com/)** | [✓](https://github.com/daformat/subtitles) | Live captions for anything your Mac plays: meetings and calls, videos, podcasts and lectures, drawn as an always-on-top overlay that stays put while you switch apps. Captures system audio with a Core Audio process tap and transcribes entirely on-device, with selectable latency and optional speaker breaks. Uses Parakeet EOU and Nemotron streaming ASR, Silero VAD, and Sortformer speaker diarization on the Apple Neural Engine. |
 
 More apps built with FluidAudio are listed in [Documentation/Showcase.md](Documentation/Showcase.md).
 

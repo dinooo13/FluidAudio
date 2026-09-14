@@ -235,4 +235,93 @@ final class CustomVocabularyTests: XCTestCase {
         XCTAssertNotNil(term.aliases)
         XCTAssertTrue(term.aliases?.isEmpty == true)
     }
+
+    // MARK: - Automatic CTC tokenization (#851)
+
+    private func fakeEncode(_ text: String) -> [Int] {
+        // Deterministic stand-in for CtcTokenizer.encode: one id per character.
+        text.unicodeScalars.map { Int($0.value) }
+    }
+
+    func testTokenizingMissingCtcTokensFillsUntokenizedTerms() {
+        let context = CustomVocabularyContext(
+            terms: [CustomVocabularyTerm(text: "NVIDIA"), CustomVocabularyTerm(text: "PyTorch", weight: 2)],
+            minSimilarity: 0.42, minTermLength: 4)
+        let result = context.tokenizingMissingCtcTokens(using: fakeEncode)
+        XCTAssertEqual(result.tokenized, 2)
+        XCTAssertTrue(result.dropped.isEmpty)
+        XCTAssertEqual(result.context.terms.map(\.text), ["NVIDIA", "PyTorch"])
+        XCTAssertEqual(result.context.terms[0].ctcTokenIds, fakeEncode("NVIDIA"))
+        XCTAssertEqual(result.context.terms[1].weight, 2, "per-term settings survive")
+        XCTAssertEqual(result.context.minSimilarity, 0.42, accuracy: 0.001, "thresholds survive")
+        XCTAssertEqual(result.context.minTermLength, 4)
+    }
+
+    func testTokenizingMissingCtcTokensLeavesPreTokenizedTermsAlone() {
+        let pre = CustomVocabularyTerm(text: "Bose", ctcTokenIds: [7, 8, 9])
+        let result = CustomVocabularyContext(terms: [pre]).tokenizingMissingCtcTokens(using: fakeEncode)
+        XCTAssertEqual(result.tokenized, 0)
+        XCTAssertEqual(result.context.terms[0].ctcTokenIds, [7, 8, 9])
+    }
+
+    /// TDT `tokenIds` index a different vocabulary; they must not stand in for CTC ids.
+    func testTokenizingMissingCtcTokensIgnoresTdtTokenIds() {
+        let tdtOnly = CustomVocabularyTerm(text: "Bose", tokenIds: [100, 200])
+        let result = CustomVocabularyContext(terms: [tdtOnly]).tokenizingMissingCtcTokens(using: fakeEncode)
+        XCTAssertEqual(result.tokenized, 1)
+        XCTAssertEqual(result.context.terms[0].ctcTokenIds, fakeEncode("Bose"))
+        XCTAssertEqual(result.context.terms[0].tokenIds, [100, 200])
+    }
+
+    func testTokenizingMissingCtcTokensDropsTermsThatEncodeToNothing() {
+        let result = CustomVocabularyContext(terms: [
+            CustomVocabularyTerm(text: "keep"), CustomVocabularyTerm(text: "drop"),
+        ]).tokenizingMissingCtcTokens(using: { $0 == "drop" ? [] : self.fakeEncode($0) })
+        XCTAssertEqual(result.context.terms.map(\.text), ["keep"])
+        XCTAssertEqual(result.dropped, ["drop"])
+    }
+
+    // MARK: - Spotter detections surfaced as ctcDetectedTerms (#899)
+
+    func testDetectedTermTextsAreTimeOrderedAndDeduplicated() {
+        func detection(_ text: String, at start: TimeInterval) -> CtcKeywordSpotter.KeywordDetection {
+            CtcKeywordSpotter.KeywordDetection(
+                term: CustomVocabularyTerm(text: text), score: -3, totalFrames: 100,
+                startFrame: Int(start * 12.5), endFrame: Int(start * 12.5) + 5,
+                startTime: start, endTime: start + 0.4)
+        }
+        let texts = VocabularyBoostingSession.detectedTermTexts([
+            detection("PyTorch", at: 9.0), detection("Codex", at: 2.0), detection("codex", at: 12.0),
+        ])
+        XCTAssertEqual(texts, ["Codex", "PyTorch"])
+        XCTAssertEqual(VocabularyBoostingSession.detectedTermTexts([]), [])
+    }
+
+    // MARK: - Bounded nearest-word fallback (#899)
+
+    private func word(_ text: String, _ start: Double, _ end: Double) -> VocabularyRescorer.WordTiming {
+        VocabularyRescorer.WordTiming(word: text, startTime: start, endTime: end, tokenRange: nil)
+    }
+
+    /// The #899 shape: a spurious detection in the first half second of the
+    /// window, whose nearest word starts much later. Unbounded, it snapped to
+    /// "Hey" 0.68 s away (and to "validate" on another machine).
+    func testFallbackRejectsWordOutsideRadius() {
+        let words = [word("Hey,", 0.90, 1.10), word("before", 1.10, 1.40), word("we", 1.40, 1.50)]
+        let center = (0.16 + 0.48) / 2
+        let nearest = VocabularyRescorer.nearestWord(in: words, toCenter: center)
+        XCTAssertEqual(nearest?.index, 0)
+        XCTAssertEqual(nearest?.delta ?? 0, 0.68, accuracy: 0.01)
+        XCTAssertNil(VocabularyRescorer.fallbackWordIndex(in: words, toCenter: center))
+        XCTAssertNil(VocabularyRescorer.fallbackWordIndex(in: words, toCenter: center, radius: 0.5))
+    }
+
+    /// A genuine near miss (CTC/TDT timestamp skew) still maps to the word.
+    func testFallbackAcceptsWordWithinRadius() {
+        let words = [word("Codex", 9.10, 9.50), word("and", 9.50, 9.60)]
+        // Detection just before the word, centre 0.35 s from the word centre.
+        XCTAssertEqual(VocabularyRescorer.fallbackWordIndex(in: words, toCenter: 8.95), 0)
+        XCTAssertNil(VocabularyRescorer.fallbackWordIndex(in: words, toCenter: 8.95, radius: 0.2))
+        XCTAssertNil(VocabularyRescorer.fallbackWordIndex(in: [], toCenter: 1.0))
+    }
 }

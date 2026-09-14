@@ -349,6 +349,91 @@ public enum PocketTtsResourceDownloader {
         return encoderPath
     }
 
+    /// Ensure the pack-local per-language voice-cloning encoder
+    /// (`v2.1/<lang>/mimi_encoderv3.mlmodelc`) is available and return its URL.
+    ///
+    /// Every language pack ships its own mimi codec weights, so cloned-voice
+    /// conditioning must be encoded with the pack's own encoder (its speaker
+    /// projection is baked in — no host-side reprojection). Best-effort:
+    /// returns `nil` when the encoder can't be fetched (offline, or not yet
+    /// published for the pack); callers then fall back to the shared root
+    /// encoder + reprojection path (#793).
+    ///
+    /// Cache acceptance goes through `ModelCache.isCacheComplete`, not bare
+    /// directory existence: an interrupted download deliberately leaves
+    /// `*.partial` staging files behind for byte-range resume, and accepting
+    /// such a bundle would fail `MLModel(contentsOf:)` later without ever
+    /// taking the shared-encoder fallback (same class as issue #819).
+    ///
+    /// Throws only on cancellation — a cancelled caller must not be routed
+    /// into the fallback (or trigger further downloads); genuine
+    /// availability/network failures return `nil`.
+    public static func ensurePackMimiEncoder(
+        language: PocketTtsLanguage, directory: URL? = nil
+    ) async throws -> URL? {
+        do {
+            let targetDir = try directory ?? cacheDirectory()
+            let modelsDirectory = targetDir.appendingPathComponent(
+                PocketTtsConstants.defaultModelsSubdirectory)
+            let repoDir = modelsDirectory.appendingPathComponent(Repo.pocketTts.folderName)
+            let encoderSubpath =
+                "\(language.repoSubdirectory)/\(ModelNames.PocketTTS.mimiEncoderV3File)"
+            let encoderPath = repoDir.appendingPathComponent(encoderSubpath)
+
+            if ModelCache.isCacheComplete(at: repoDir, requiredFiles: [encoderSubpath]) {
+                return encoderPath
+            }
+
+            try FileManager.default.createDirectory(
+                at: repoDir, withIntermediateDirectories: true)
+
+            logger.info(
+                "Downloading per-language Mimi encoder for \(language.rawValue) voice cloning...")
+            try await ModelHub.download(
+                .pocketTts,
+                subdirectory: encoderSubpath,
+                to: repoDir
+            )
+
+            if ModelCache.isCacheComplete(at: repoDir, requiredFiles: [encoderSubpath]) {
+                return encoderPath
+            }
+
+            // Still incomplete after a resume attempt: a genuinely interrupted
+            // transfer resumes its `.partial` and completes above, so what's
+            // left is a corrupt bundle the resume path can't repair (e.g. a
+            // stale staging file next to complete weights). Clear it and
+            // re-download once from scratch — same delete-and-retry semantics
+            // as `ModelHub.loadWithRecovery`.
+            logger.warning(
+                "Per-language Mimi encoder bundle for \(language.rawValue) is corrupt after "
+                    + "resume; clearing and re-downloading once...")
+            try? FileManager.default.removeItem(at: encoderPath)
+            try await ModelHub.download(
+                .pocketTts,
+                subdirectory: encoderSubpath,
+                to: repoDir
+            )
+
+            guard ModelCache.isCacheComplete(at: repoDir, requiredFiles: [encoderSubpath]) else {
+                logger.warning(
+                    "Per-language Mimi encoder unavailable or incomplete for \(language.rawValue); "
+                        + "falling back to the shared encoder + reprojection (#793).")
+                return nil
+            }
+            return encoderPath
+        } catch {
+            if RetryPolicy.isCancellation(error) {
+                throw error
+            }
+            logger.warning(
+                "Failed to fetch per-language Mimi encoder for \(language.rawValue): "
+                    + "\(error.localizedDescription). Falling back to the shared encoder + "
+                    + "reprojection (#793).")
+            return nil
+        }
+    }
+
     /// Ensure voice conditioning data for the given language is available,
     /// downloading from HuggingFace if missing.
     ///

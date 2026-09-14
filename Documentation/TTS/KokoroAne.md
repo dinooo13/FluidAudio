@@ -14,11 +14,11 @@ used with the author's permission. Conversion lives in
 | Aspect           | `KokoroAneManager`                              |
 |------------------|-------------------------------------------------|
 | Compute          | 4 stages on ANE, 3 on GPU                       |
-| Voices           | Single per variant (`af_heart` / `zf_001`)      |
-| Input length     | ≤ 510 IPA / Bopomofo phonemes / utt.            |
+| Voices           | Variant catalogs (54 English / 103 zh / 5 ja)   |
+| Input length     | ≤ 510 phoneme characters / utterance             |
 | Custom lexicon   | No                                              |
 | SSML             | No                                              |
-| Languages        | English (`ANE/`) + Mandarin (`ANE-zh/`)         |
+| Languages        | English (`ANE/`), Mandarin (`ANE-zh/`), Japanese (`ANE-ja/`) |
 
 For multi-voice / SSML / long-form, use `PocketTtsSynthesizer` or
 `StyleTTS2Manager` instead.
@@ -34,12 +34,14 @@ text-to-phoneme frontend differ.
 |---------------|-------------|-------|---------------|-----------------------------|--------------------------------------------|
 | `.english`    | `ANE/`      | 177   | `af_heart`    | flat (`<voice>.bin`)        | G2P CoreML (BART seq2seq) → IPA            |
 | `.mandarin`   | `ANE-zh/`   | 171   | `zf_001`      | nested (`voices/<voice>.bin`) | Rule-based dict lookup → Bopomofo + tones |
+| `.japanese`   | `ANE-ja/`   | 114   | `jf_alpha`    | nested (`voices/<voice>.bin`) | MeCab (unidic-lite) + Cutlet rules → IPA |
 
 Pick the variant on construction:
 
 ```swift
 let english  = KokoroAneManager(variant: .english)   // default
 let mandarin = KokoroAneManager(variant: .mandarin)
+let japanese = KokoroAneManager(variant: .japanese)
 ```
 
 ## Quick Start
@@ -56,6 +58,11 @@ swift run fluidaudiocli tts "Welcome to FluidAudio" \
 swift run fluidaudiocli tts "你好世界，今天天气真好。" \
   --backend kokoro-ane --variant zh \
   --output ~/Desktop/demo_zh.wav
+
+# Japanese (plain kana/kanji)
+swift run fluidaudiocli tts "今日は良い天気です。" \
+  --backend kokoro-ane --variant ja \
+  --output ~/Desktop/demo_ja.wav
 ```
 
 First invocation downloads the 7 `.mlmodelc` bundles + `vocab.json` +
@@ -63,10 +70,15 @@ default voice from
 [`FluidInference/kokoro-82m-coreml/ANE/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE)
 (English) or
 [`ANE-zh/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE-zh)
-(Mandarin); later runs reuse the cached assets. The Mandarin variant
+(Mandarin) or
+[`ANE-ja/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE-ja)
+(Japanese); later runs reuse the cached assets. The Mandarin variant
 additionally fetches the G2P pinyin dictionaries from
 [`ANE-zh/assets/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE-zh/assets)
 on first synthesis (~10 MB, cached at `<repoDir>/g2p/`).
+Japanese plain-text synthesis lazily downloads the trimmed unidic-lite
+dictionary and Cutlet word list (about 115 MB) on first use. IPA bypass
+calls do not download them.
 
 ### Swift
 
@@ -83,6 +95,11 @@ let enWav = try await english.synthesize(text: "Hello from FluidAudio!")
 let mandarin = KokoroAneManager(variant: .mandarin)
 try await mandarin.initialize()
 let zhWav = try await mandarin.synthesize(text: "你好世界")
+
+// Japanese — MeCab resolves contextual kanji readings before IPA mapping.
+let japanese = KokoroAneManager(variant: .japanese)
+try await japanese.initialize()
+let jaWav = try await japanese.synthesize(text: "今日中に返します。")
 ```
 
 ### Per-stage timings
@@ -105,6 +122,9 @@ let enWav = try await english.synthesizeFromPhonemes("həˈloʊ wɝld")
 // Mandarin: pre-computed Bopomofo + tone digits matching the
 // `ANE-zh/vocab.json` token set.
 let zhWav = try await mandarin.synthesizeFromPhonemes("ㄋㄧ2ㄏㄠ3")
+
+// Japanese: pre-computed IPA remains supported.
+let jaWav = try await japanese.synthesizeFromPhonemes("aɾʲiɡatoː")
 ```
 
 Useful when you've already phonemized upstream.
@@ -114,6 +134,7 @@ Useful when you've already phonemized upstream.
 ```
 English:   text → G2P (CoreML BART) → IPA → vocab.json → token ids
 Mandarin:  text → MandarinG2P (dict + sandhi) → Bopomofo → vocab.json → token ids
+Japanese:  text → MeCab (unidic-lite) → Cutlet rules → Kokoro IPA → vocab.json → token ids
                                                                           │
         ┌─────────────────────────────────────────────────────────────────┘
         ▼
@@ -156,11 +177,21 @@ is a flat `[510, 256]` fp32 matrix. Row index = `min(max(phonemeCount - 1,
 + Prosody).
 
 The English bundle stores voice packs flat at the bundle root
-(`<voice>.bin`); the Mandarin bundle nests them under `voices/<voice>.bin`.
-This single-voice-per-variant constraint is intrinsic to the upstream
-conversion — adding voices requires re-converting `KokoroPostAlbert` /
-`KokoroProsody` / `KokoroNoise` / `KokoroVocoder` against the new style
-embeddings.
+(`<voice>.bin`); the Mandarin and Japanese bundles nest them under
+`voices/<voice>.bin`.
+
+**Any Kokoro-82M v1.0 voice works with the English chain.** The four style
+consumers take `style_s` / `style_timbre` as runtime inputs — nothing is baked
+into the converted models — so a voice is just another `[510, 256]` pack. The
+English bundle publishes only `af_heart.bin` pre-converted; for any other name
+`KokoroAneResourceDownloader.ensureVoicePack` fetches the repo-root
+`voices/<name>.json` (the upstream v1.0 set, 54 voices, see
+`KokoroAneConstants.englishVoices`) and converts it on first use — row `k` of
+the flat pack is JSON key `"k+1"`, verified byte-exact against `af_heart.bin`
+(#896). Pick with `KokoroAneManager(defaultVoice:)` or `synthesize(text:voice:)`;
+an unknown name throws `KokoroAneError.voiceNotFound` listing the catalog.
+The Mandarin bundle ships 103 voices and the Japanese bundle 5, all
+pre-converted (`KokoroAneConstants.mandarinVoices` / `japaneseVoices`).
 
 ## Mandarin G2P
 
@@ -195,12 +226,51 @@ fallback, POS-aware tone sandhi, neural polyphone disambiguation
 viable upgrades — the current pipeline trades them for a zero-network
 ~10 MB footprint that handles short conversational text well.
 
+## Japanese G2P
+
+The Japanese frontend is an in-process port of Misaki's Cutlet
+(`misaki/cutlet.py`), the text → IPA path Kokoro's Japanese voices were
+trained on, in the same shape as the Mandarin frontend: no linked runtime,
+assets downloaded from HuggingFace on first use.
+
+1. `NemoTextNormalizer` (Japanese) spells digits, currency and units as
+   kanji numerals, as for the other backends.
+2. `JapaneseTokenizer` is a MeCab-compatible Viterbi tokenizer over
+   `JapaneseMecabDictionary`, a memory-mapped reader of the standard MeCab
+   binary layout (double array, token table, feature strings, `char.bin`
+   categories, `unk.dic`, connection matrix). The dictionary is `unidic-lite`,
+   the one fugashi/Cutlet use, trimmed by
+   `mobius/models/tts/kokoro/coreml/g2p/japanese/convert_unidic_lite.py` to
+   the three fields the frontend needs (`pos1,pron,kana`): 188 MB → 41 MB,
+   with the 71 MB connection matrix copied unchanged. Segmentation and
+   readings are identical to fugashi on the reference sentences.
+3. `JapaneseCutlet` applies Cutlet's rules: width folding, digit runs read
+   as kana, regrouping of tokens that form a dictionary word
+   (`ja_words.txt`, 日本 + 語 → 日本語), the hiragana → IPA table with its
+   context rules (digraphs, sokuon `ʔ`, the moraic nasal as m/ŋ/ɲ/n/ɴ, long
+   vowels `ː`), and Cutlet's spacing.
+
+On the 100-phrase MiniMax Japanese corpus the output is byte-identical to
+Misaki's `ja.JAG2P()` on the 88 sentences without digits. The 12 with digits
+differ only in how numerals are grouped, because they arrive as kanji from
+NeMo rather than Cutlet's hiragana digit reader; the readings are correct and
+sometimes better (`2人` → ふたり where Cutlet says に-ひと). Cutlet's own
+quirks are reproduced on purpose, since they are in Kokoro's training
+distribution (`今日中` → こんにち-ちゅう, `私` → わたくし).
+
+Assets: `sys.dic` (41 MB), `matrix.bin` (71 MB), `char.bin`, `unk.dic`,
+`ja_words.txt` (2 MB) under `ANE-ja/assets/` on HuggingFace, cached in
+`<repoDir>/g2p/`. They are fetched only when plain Japanese text is
+synthesized; `synthesizeFromPhonemes` never needs them. A TTS → ASR round
+trip through the Japanese ASR model (`transcribe --model-version tdt-ja`)
+returns the documentation sentences verbatim.
+
 ## Limits
 
 - **Phonemes:** ≤ 510 IPA / Bopomofo chars per call (ALBERT context = 512
   incl. BOS/EOS). No built-in chunker — split upstream if you need longer
   inputs.
-- **Voices:** `af_heart` only (English) / `zf_001` only (Mandarin).
+- **Voices:** any pack in the variant's catalog (`KokoroAneVariant.knownVoices`): 54 English (converted on first use), 103 Mandarin, 5 Japanese. See "Voice packs" above.
 - **Custom lexicon / SSML / Markdown overrides:** not supported. The pipeline
   goes `text → G2P → phonemes → token ids` with no interception point.
 - **Acoustic frames:** `T_a ≤ 2000` (compile-time `--max-frames` baked into
@@ -252,22 +322,33 @@ The following OS/runtime constraints affect the 7-stage chain:
 |-----|-----------|-------------|--------|
 | BNNS CPU segfault | `EXC_BAD_ACCESS` in `libBNNS.dylib` (`BNNSGraphContextExecute_v2` → `BnnsCpuInferenceOperation::ExecuteSync`, queue `com.apple.e5rt.concurrentExecutionQueue`) | iOS/macOS **26.4 – 26.5.x** | **Fixed in the 26.6 line.** Verified on M5/macOS 26.6: the #667 repro (repeated synthesis) passes under `cpuOnly` and `allAne`, both of which segfaulted every time on 26.5. |
 | GPU RNN JIT assert | `GPURNNOps.mm: failed assertion 'JIT not supported'` (SIGABRT) | macOS 26.5+, incl. **26.6** (M5-class) | **Still live.** Avoided by the default routing (#671/#677), which keeps RNN-bearing stages off the GPU. Do not route Prosody/Vocoder to `.cpuAndGPU`. |
+| MPSGraph abort (Metal route) | `SIGABRT` in MetalPerformanceShadersGraph while a GPU stage (noise / tail) runs under Core ML | iOS/iPadOS **27.0 through beta 8** (24A5430a), iPad17,2 and iPad16,2 | **Still live.** The default routing on OS 27 (`aneTailCpu`, #849) keeps Metal out of the chain. |
+| BNNS `vadd_fp16_sme` segfault (Metal-free route) | `SIGSEGV` in `libBNNS` `vadd_fp16_sme_internal` on the OS-27 default route (noise + tail on CPU) | iOS **27.0** (24A5418b), iPhone18,1, ~54 min into a session | **No safe Core ML route on iOS 27 is demonstrated** (#889). The model, phonemizer and voice packs are not at fault: the same Kokoro-82M v1.0 graph ran 2 h 34 min on ONNX Runtime's CPU provider on the same OS line. `initialize()` logs an advisory on the 27 line. |
 
 The BNNS segfault cannot be avoided by compute-unit routing — CoreML places
 segments on the BNNS CPU path even under `.cpuOnly` (#587), and on affected
 OS builds the same binary can flip between all-pass and all-crash across a
 day (#817). `KokoroAneManager.initialize()` logs a warning on affected OS
-builds. The only reliable remedy is updating to the 26.6 OS line.
+builds. On macOS the remedy is the 26.6 line. On iOS the 26.6 line still
+crashes (#844), and on the iOS 27 line both Core ML routes have terminated
+the process (#889), so there is currently no OS version or routing on iOS
+that is demonstrated safe for long sessions; whether Kokoro ANE should be
+disabled by default there is tracked in #889.
 
 History: #328 (26.4 beta), #587 (iOS 26.4.2), #661 (cross-manager E5RT),
-#667 (M5/macOS 26.5), #817 (time/environment-gated evidence).
+#667 (M5/macOS 26.5), #817 (time/environment-gated evidence), #843/#849
+(OS 27 Metal abort, CPU-tail default), #844 (iOS 26.6), #889 (iOS 27 BNNS
+segfault on the CPU-tail route).
 
 ## Source
 
 - HuggingFace (English): [`FluidInference/kokoro-82m-coreml/ANE/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE)
 - HuggingFace (Mandarin): [`FluidInference/kokoro-82m-coreml/ANE-zh/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE-zh)
+- HuggingFace (Japanese): [`FluidInference/kokoro-82m-coreml/ANE-ja/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE-ja)
 - Upstream PyTorch (English): [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
 - Upstream PyTorch (Mandarin): [hexgrad/Kokoro-82M-v1.1-zh](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)
 - Mandarin G2P reference: [hexgrad/misaki](https://github.com/hexgrad/misaki) (`zh_frontend.py`, `tone_sandhi.py`)
+- Japanese dictionary: [unidic-lite](https://github.com/polm/unidic-lite) (BSD), trimmed by the mobius script
+- Japanese frontend reference: [hexgrad/misaki](https://github.com/hexgrad/misaki) `cutlet.py` (Apache-2.0, adapted from polm/cutlet)
 - Conversion script: [mobius/models/tts/kokoro/laishere-coreml](https://github.com/FluidInference/mobius/tree/main/models/tts/kokoro/laishere-coreml)
 - Original CoreML fork: [laishere/kokoro-coreml](https://github.com/laishere/kokoro-coreml)

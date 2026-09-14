@@ -4,6 +4,12 @@ import Foundation
 import OSLog
 
 @available(macOS 14.0, iOS 17.0, *)
+private enum OfflinePreparationWorkerResult: Sendable {
+    case segmentation(SegmentationOutput, TimeInterval)
+    case embeddings([TimedEmbedding], TimeInterval)
+}
+
+@available(macOS 14.0, iOS 17.0, *)
 public final class OfflineDiarizerManager {
     private let logger = AppLogger(category: "OfflineDiarizer")
     private let config: OfflineDiarizerConfig
@@ -17,8 +23,38 @@ public final class OfflineDiarizerManager {
     }
 
     public func initialize(models: OfflineDiarizerModels) {
+        if Self.isBnnsCrashProneOS(ProcessInfo.processInfo.operatingSystemVersion) {
+            logger.warning(
+                "macOS 14 has a known Apple BNNS bug that can crash offline "
+                    + "diarization (EXC_BAD_ACCESS in libBNNS) when predictions run on the "
+                    + "BNNS CPU path. Reproduced 1200/1200 with .cpuAndNeuralEngine on "
+                    + "hosts without an ANE; serialization does not help. GPU-enabled "
+                    + "routing (.all) is reported to stop reproduction but is unverified. "
+                    + "Fixed in macOS 15. "
+                    + "See https://github.com/FluidInference/FluidAudio/issues/878")
+        }
         self.models = models
         logger.info("Offline diarizer models initialized")
+    }
+
+    #if os(macOS)
+    private static let runningOnMacOS = true
+    #else
+    private static let runningOnMacOS = false
+    #endif
+
+    /// macOS 14 carries an Apple BNNS bug that crashes Core ML predictions on
+    /// the BNNS CPU path (`BNNSGraphContextExecute_v2` → `_platform_memmove`,
+    /// #661/#878). Deterministic on machines without an ANE, intermittent on
+    /// Apple Silicon when predictions fall back from the ANE. Serialization does
+    /// not avoid it. The #878 matrix only tested `.cpuAndNeuralEngine`; its
+    /// harness notes that GPU-enabled routing (`.all`) stops reproduction, which
+    /// is unverified as a mitigation. Apple fixed it in macOS 15. iOS is
+    /// unflagged — no reproduction has been reported on the iOS 17 line.
+    static func isBnnsCrashProneOS(
+        _ version: OperatingSystemVersion, onMacOS: Bool = runningOnMacOS
+    ) -> Bool {
+        onMacOS && version.majorVersion == 14
     }
 
     /// Ensure offline diarizer models are available, downloading and compiling them when needed.
@@ -187,64 +223,93 @@ public final class OfflineDiarizerManager {
         let capturedModels = models
         let capturedConfig = config
 
-        let segmentationTask = Task.detached(priority: .userInitiated) {
-            [capturedModels, capturedConfig] () throws -> (SegmentationOutput, TimeInterval) in
-            let processor = OfflineSegmentationProcessor()
-            let start = Date()
-            do {
-                let segmentation = try await processor.process(
-                    audioSource: audioSource,
-                    segmentationModel: capturedModels.segmentationModel,
-                    config: capturedConfig,
-                    chunkHandler: { chunk in
-                        progressCallback?(chunk.chunkIndex + 1, totalChunks)
-                        switch chunkContinuation.yield(chunk) {
-                        case .enqueued, .dropped:
-                            return .continue
-                        case .terminated:
-                            return .stop
-                        @unknown default:
-                            return .stop
+        let results = try await withThrowingTaskGroup(
+            of: OfflinePreparationWorkerResult.self,
+            returning: (
+                segmentation: (SegmentationOutput, TimeInterval),
+                embeddings: ([TimedEmbedding], TimeInterval)
+            ).self
+        ) { group in
+            group.addTask(priority: .userInitiated) { [capturedModels, capturedConfig] in
+                let processor = OfflineSegmentationProcessor()
+                let start = Date()
+                do {
+                    let segmentation = try await processor.process(
+                        audioSource: audioSource,
+                        segmentationModel: capturedModels.segmentationModel,
+                        config: capturedConfig,
+                        chunkHandler: { chunk in
+                            progressCallback?(chunk.chunkIndex + 1, totalChunks)
+                            switch chunkContinuation.yield(chunk) {
+                            case .enqueued, .dropped:
+                                return .continue
+                            case .terminated:
+                                return .stop
+                            @unknown default:
+                                return .stop
+                            }
                         }
-                    }
+                    )
+                    chunkContinuation.finish()
+                    return .segmentation(
+                        segmentation,
+                        Date().timeIntervalSince(start)
+                    )
+                } catch {
+                    chunkContinuation.finish(throwing: error)
+                    throw error
+                }
+            }
+
+            group.addTask(priority: .userInitiated) { [capturedModels, capturedConfig] in
+                let extractor = OfflineEmbeddingExtractor(
+                    fbankModel: capturedModels.fbankModel,
+                    embeddingModel: capturedModels.embeddingModel,
+                    pldaTransform: PLDATransform(
+                        pldaRhoModel: capturedModels.pldaRhoModel,
+                        psi: capturedModels.pldaPsi
+                    ),
+                    config: capturedConfig
                 )
-                chunkContinuation.finish()
-                return (segmentation, Date().timeIntervalSince(start))
+                let start = Date()
+                let embeddings = try await extractor.extractEmbeddings(
+                    audioSource: audioSource,
+                    segmentationStream: chunkStream
+                )
+                return .embeddings(
+                    embeddings,
+                    Date().timeIntervalSince(start)
+                )
+            }
+
+            var segmentationResult: (SegmentationOutput, TimeInterval)?
+            var embeddingResult: ([TimedEmbedding], TimeInterval)?
+
+            do {
+                while let result = try await group.next() {
+                    switch result {
+                    case .segmentation(let segmentation, let duration):
+                        segmentationResult = (segmentation, duration)
+                    case .embeddings(let embeddings, let duration):
+                        embeddingResult = (embeddings, duration)
+                    }
+                }
             } catch {
+                group.cancelAll()
                 chunkContinuation.finish(throwing: error)
                 throw error
             }
+
+            guard let segmentationResult, let embeddingResult else {
+                throw OfflineDiarizationError.processingFailed(
+                    "Offline preparation workers ended without complete results"
+                )
+            }
+            return (segmentationResult, embeddingResult)
         }
 
-        let embeddingTask = Task.detached(priority: .userInitiated) {
-            [capturedModels, capturedConfig] () throws -> ([TimedEmbedding], TimeInterval) in
-            let extractor = OfflineEmbeddingExtractor(
-                fbankModel: capturedModels.fbankModel,
-                embeddingModel: capturedModels.embeddingModel,
-                pldaTransform: PLDATransform(pldaRhoModel: capturedModels.pldaRhoModel, psi: capturedModels.pldaPsi),
-                config: capturedConfig
-            )
-            let start = Date()
-            let embeddings = try await extractor.extractEmbeddings(
-                audioSource: audioSource,
-                segmentationStream: chunkStream
-            )
-            return (embeddings, Date().timeIntervalSince(start))
-        }
-
-        let segmentationResult: (SegmentationOutput, TimeInterval)
-        let embeddingResult: ([TimedEmbedding], TimeInterval)
-        do {
-            async let awaitedSegmentation = segmentationTask.value
-            async let awaitedEmbeddings = embeddingTask.value
-            segmentationResult = try await awaitedSegmentation
-            embeddingResult = try await awaitedEmbeddings
-        } catch {
-            segmentationTask.cancel()
-            embeddingTask.cancel()
-            chunkContinuation.finish(throwing: error)
-            throw error
-        }
+        let segmentationResult = results.segmentation
+        let embeddingResult = results.embeddings
 
         let (segmentation, segmentationTime) = segmentationResult
         logger.debug("Segmentation completed in \(segmentationTime)s (async)")
@@ -342,37 +407,13 @@ public final class OfflineDiarizerManager {
             )
         }
 
-        let centroidComputation = computeCentroids(
-            trainingEmbeddings: trainingEmbeddings,
+        let (centroids, assignments) = clusterAssignments(
             vbxOutput: vbxOutput,
-            initialClusters: initialClusters
+            trainingEmbeddings: trainingEmbeddings,
+            embeddingFeatures: embeddingFeatures,
+            initialClusters: initialClusters,
+            chunkIndices: timedEmbeddings.map(\.chunkIndex)
         )
-        var centroids = centroidComputation.centroids
-        if centroids.isEmpty {
-            centroids = computeFallbackCentroids(from: embeddingFeatures)
-        }
-        // pyannote parity: constrain co-chunk speakers to distinct clusters, but
-        // not when the count was forced via K-Means — the constraint can then
-        // artificially inflate the number of speakers.
-        let useConstrainedAssignment =
-            config.clustering.constrainedAssignment
-            && !vbxOutput.wasAdjusted
-            && centroids.count > 1
-        let assignments: [Int]
-        if useConstrainedAssignment {
-            assignments = ConstrainedClusterAssignment.assign(
-                scores: centroidScores(
-                    embeddingFeatures: embeddingFeatures,
-                    centroids: centroids
-                ),
-                chunkIndices: timedEmbeddings.map(\.chunkIndex)
-            )
-        } else {
-            assignments = assignEmbeddings(
-                embeddingFeatures: embeddingFeatures,
-                centroids: centroids
-            )
-        }
 
         let chunkAssignments = buildChunkAssignments(
             segmentation: segmentation,
@@ -608,6 +649,54 @@ public final class OfflineDiarizerManager {
         }
 
         return selected
+    }
+
+    /// Turns a VBx output into per-embedding cluster assignments.
+    ///
+    /// Split out of `cluster(_:)` so the centroid census and the assignment rule
+    /// can be exercised together without CoreML models: given a `VBxOutput`, the
+    /// rest of this stage is pure arithmetic. The speaker count a caller finally
+    /// observes is `Set(assignments).count`, which is what speaker count
+    /// constraints have to hold for.
+    func clusterAssignments(
+        vbxOutput: VBxOutput,
+        trainingEmbeddings: [[Double]],
+        embeddingFeatures: [[Double]],
+        initialClusters: [Int],
+        chunkIndices: [Int]
+    ) -> (centroids: [[Double]], assignments: [Int]) {
+        let centroidComputation = computeCentroids(
+            trainingEmbeddings: trainingEmbeddings,
+            vbxOutput: vbxOutput,
+            initialClusters: initialClusters
+        )
+        var centroids = centroidComputation.centroids
+        if centroids.isEmpty {
+            centroids = computeFallbackCentroids(from: embeddingFeatures)
+        }
+        // pyannote parity: constrain co-chunk speakers to distinct clusters, but
+        // not when the count was forced via K-Means — the constraint can then
+        // artificially inflate the number of speakers.
+        let useConstrainedAssignment =
+            config.clustering.constrainedAssignment
+            && !vbxOutput.wasAdjusted
+            && centroids.count > 1
+        let assignments: [Int]
+        if useConstrainedAssignment {
+            assignments = ConstrainedClusterAssignment.assign(
+                scores: centroidScores(
+                    embeddingFeatures: embeddingFeatures,
+                    centroids: centroids
+                ),
+                chunkIndices: chunkIndices
+            )
+        } else {
+            assignments = assignEmbeddings(
+                embeddingFeatures: embeddingFeatures,
+                centroids: centroids
+            )
+        }
+        return (centroids, assignments)
     }
 
     private func computeCentroids(
