@@ -64,6 +64,11 @@ final class GrowingAudioSampleSource: AudioSampleSource, @unchecked Sendable {
 ///
 /// One window runs at a time — that is the point. The caller pays a single
 /// window at release instead of one per fifteen seconds of speech.
+///
+/// Audio that fits the model's window is handed to `AsrManager.transcribe`
+/// whole, because that is what a batch run does with it — `ChunkProcessor`
+/// is never built at that length. No window can have run early there, so the
+/// short path costs nothing and keeps the identity true at every length.
 public actor IncrementalChunkProcessor {
 
     private let manager: AsrManager
@@ -146,6 +151,23 @@ public actor IncrementalChunkProcessor {
         let chunker = ChunkProcessor(sampleSource: source)
         let totalSamples = chunker.totalSamples
         // The final window must end at the last speech-bearing frame, not EOF.
+        // Audio that fits the model's window never reaches `ChunkProcessor` in
+        // a batch run: `transcribeWithState` short-circuits, frame-aligns the
+        // whole buffer and makes one padded pass. A `ChunkProcessor` window
+        // over the same audio declares a different length — trimmed to the
+        // speech end, with `actualAudioFrames` derived from it — and decodes
+        // differently: on a ten-second fixture the short path writes
+        // "seven," where a single window writes "7,". Identity with a batch
+        // transcription therefore requires taking the same short path here.
+        //
+        // Nothing is given up by it. A window can only run before the end when
+        // more than `chunkSamples` of audio precedes it, and `chunkSamples` is
+        // the model window itself, so at this length no window has run and
+        // there is nothing to merge.
+        if windows.isEmpty, totalSamples <= ASRConstants.maxModelSamples {
+            return try await transcribeWholeBuffer(in: chunker, totalSamples: totalSamples)
+        }
+
         let speechEnd = endAligned ? try chunker.speechEndSamples() : totalSamples
 
         // `process` keeps looping until a window reports itself last. Normally
@@ -194,6 +216,27 @@ public actor IncrementalChunkProcessor {
         windows.removeAll()
         pendingStart = nil
         source.removeAll()
+    }
+
+    /// The whole utterance through `AsrManager.transcribe`, which is the call
+    /// a batch transcription of the same samples makes. Used only for audio
+    /// that fits the model's window, where no window has run early.
+    private func transcribeWholeBuffer(
+        in chunker: ChunkProcessor,
+        totalSamples: Int
+    ) async throws -> ASRResult {
+        let samples = try chunker.readSamples(offset: 0, count: totalSamples)
+        // `transcribe` rejects audio below 0.3 s. Pad rather than fail, so a
+        // very short utterance still returns what the batch callers get; they
+        // pad the same way before calling.
+        let minimum = ASRConstants.minimumRequiredSamples(forSampleRate: ASRConstants.sampleRate)
+        let padded =
+            samples.count < minimum
+            ? samples + [Float](repeating: 0, count: minimum - samples.count)
+            : samples
+        var state = TdtDecoderState.make(decoderLayers: decoderLayers)
+        state.reset()
+        return try await manager.transcribe(padded, decoderState: &state, language: language)
     }
 
     // MARK: - Window scheduling

@@ -84,6 +84,58 @@ final class IncrementalChunkProcessorTests: XCTestCase {
         )
     }
 
+    /// Audio that fits the model's window never reaches `ChunkProcessor` in a
+    /// batch run, so the contract at this length is against `AsrManager`
+    /// itself. Comparing with `ChunkProcessor.process` instead would pass
+    /// while the texts a caller actually sees differ.
+    func testIncrementalMatchesBatchTranscriptionForShortAudio() async throws {
+        try XCTSkipIf(
+            ProcessInfo.processInfo.environment["CI"] != nil,
+            "Skipping model-dependent test in CI environment"
+        )
+        let modelDirectory = AsrModels.defaultCacheDirectory(for: .v3)
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: modelDirectory.path),
+            "parakeet-tdt-0.6b-v3 is not in the local model cache"
+        )
+        guard let samples = try Self.synthesiseSpeech(Self.shortSpokenText) else {
+            throw XCTSkip("`say` is not available to render the test audio")
+        }
+        // Under one model window: no window can run before the end.
+        XCTAssertLessThanOrEqual(samples.count, ASRConstants.maxModelSamples)
+
+        let models = try await AsrModels.load(from: modelDirectory, version: .v3)
+        let manager = AsrManager()
+        try await manager.loadModels(models)
+        defer { Task { await manager.cleanup() } }
+
+        var batchState = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
+        let batchResult = try await manager.transcribe(samples, decoderState: &batchState)
+
+        let incremental = try await IncrementalChunkProcessor(manager: manager)
+        var offset = 0
+        let piece = ASRConstants.sampleRate
+        while offset < samples.count {
+            let end = min(offset + piece, samples.count)
+            try await incremental.append(Array(samples[offset..<end]))
+            offset = end
+        }
+        let incrementalResult = try await incremental.finish()
+
+        XCTAssertFalse(batchResult.text.isEmpty, "the batch run produced no text to compare against")
+        XCTAssertEqual(
+            incrementalResult.text,
+            batchResult.text,
+            "incremental text diverged from the batch transcription of short audio"
+        )
+    }
+
+    /// A few seconds, comfortably inside the model's fifteen-second window.
+    private static let shortSpokenText = """
+        The morning train left the station a few minutes after seven.
+        A thin fog still covered the fields on both sides of the track.
+        """
+
     /// Renders the script with `say` straight to 16 kHz mono Float32 — the
     /// format the models take — and returns the samples. Nil when `say` fails.
     private static func synthesiseSpeech(_ text: String) throws -> [Float]? {
