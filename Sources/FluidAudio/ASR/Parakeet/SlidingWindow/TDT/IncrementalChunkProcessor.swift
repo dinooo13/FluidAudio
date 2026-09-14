@@ -57,7 +57,6 @@ public actor IncrementalChunkProcessor {
 
     private let decoderLayers: Int
     private let endAligned: Bool
-    private let preferSilenceAlignment: Bool
     private let layout:
         (
             chunkSamples: Int, strideSamples: Int, melContextSamples: Int,
@@ -83,11 +82,30 @@ public actor IncrementalChunkProcessor {
         let modelVersion = await manager.modelVersion
         let dualDecodeArbitration = await manager.dualDecodeArbitration
 
-        // `process` routes v3/no-mel to a two-decode path with its own
-        // window bookkeeping.
+        // `process` routes v3/no-mel to a two-decode path with its own window
+        // bookkeeping.
         if dualDecodeArbitration, !melChunkContext, modelVersion == .v3 {
             throw ASRError.processingFailed(
                 "IncrementalChunkProcessor does not support dualDecodeArbitration"
+            )
+        }
+        // Silence-aligned starts search a few seconds either side of the
+        // nominal position. Forward of it is audio that has not arrived, so the
+        // search would see a truncated signal and settle on a start `process`
+        // would not have chosen. Refuse the layout rather than diverge from it;
+        // supporting it needs the search bounded explicitly and the decision
+        // held until the window it looks at is complete.
+        let warmupPrefixSamples = ChunkProcessor(sampleSource: self.source)
+            .chunkLayout(melChunkContext: melChunkContext, modelVersion: modelVersion)
+            .warmupPrefixSamples
+        if !melChunkContext, modelVersion == .v3 {
+            throw ASRError.processingFailed(
+                "IncrementalChunkProcessor does not support silence-aligned chunk starts"
+            )
+        }
+        if warmupPrefixSamples > 0 {
+            throw ASRError.processingFailed(
+                "IncrementalChunkProcessor does not support a warmup prefix"
             )
         }
 
@@ -95,7 +113,6 @@ public actor IncrementalChunkProcessor {
         self.language = language
         self.decoderLayers = await manager.decoderLayerCount
         self.endAligned = ChunkProcessor.supportsSuppressedPrefix(modelVersion)
-        self.preferSilenceAlignment = !melChunkContext && modelVersion == .v3
 
         let chunker = ChunkProcessor(sampleSource: self.source)
         self.layout = chunker.chunkLayout(
@@ -315,19 +332,9 @@ public actor IncrementalChunkProcessor {
                 )
             )
         }
-        guard preferSilenceAlignment || layout.warmupPrefixSamples > 0 else {
-            // `regularChunkStarts` is just the nominal grid.
-            return remember(ChunkProcessor.ChunkStartDecision(start: target, useWarmupPrefix: false))
-        }
-        return remember(
-            try chunker.nextSilenceAlignedStart(
-                after: previousStart,
-                target: target,
-                chunkSamples: layout.chunkSamples,
-                strideSamples: layout.strideSamples,
-                canUseWarmupPrefix: layout.warmupPrefixSamples > 0
-            )
-        )
+        // `regularChunkStarts`, the only layout this type accepts, is the
+        // nominal grid.
+        return remember(ChunkProcessor.ChunkStartDecision(start: target, useWarmupPrefix: false))
     }
 
     private func remember(

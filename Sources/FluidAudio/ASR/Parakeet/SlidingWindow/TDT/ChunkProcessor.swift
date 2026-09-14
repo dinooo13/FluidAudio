@@ -191,101 +191,80 @@ struct ChunkProcessor {
         strideSamples: Int,
         canUseWarmupPrefix: Bool
     ) throws -> [ChunkStartDecision] {
-        var starts = [ChunkStartDecision(start: 0, useWarmupPrefix: false)]
-        var previousStart = 0
-        var target = strideSamples
-
-        while target < totalSamples {
-            let decision = try nextSilenceAlignedStart(
-                after: previousStart,
-                target: target,
-                chunkSamples: chunkSamples,
-                strideSamples: strideSamples,
-                canUseWarmupPrefix: canUseWarmupPrefix
-            )
-            starts.append(decision)
-            previousStart = decision.start
-            target += strideSamples
-        }
-
-        return starts
-    }
-
-    /// One step of `silenceAlignedChunkStarts`: the start of the window whose
-    /// nominal position is `target`, given the previous window's start. The
-    /// search is clipped to `totalSamples` and reads no sample above
-    /// `previousStart + chunkSamples - minimumOverlapSamples + frameSamples`,
-    /// so a caller holding that much audio gets the start `process` would pick
-    /// without the rest of the recording.
-    func nextSilenceAlignedStart(
-        after previousStart: Int,
-        target: Int,
-        chunkSamples: Int,
-        strideSamples: Int,
-        canUseWarmupPrefix: Bool
-    ) throws -> ChunkStartDecision {
         let frameSamples = ASRConstants.samplesPerEncoderFrame
         let silenceSearchRadiusFrames = max(1, Int((4.0 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
         let valleySearchRadiusFrames = max(1, Int((0.5 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
         let halfEnergyWindowSamples = frameSamples
         let minimumOverlapSamples = frameSamples * 6
 
-        let targetFrame = target / frameSamples
-        let latestCoveredStart = previousStart + chunkSamples - minimumOverlapSamples
-        let targetStart = min(max(targetFrame * frameSamples, previousStart + frameSamples), latestCoveredStart)
+        var starts = [ChunkStartDecision(start: 0, useWarmupPrefix: false)]
+        var previousStart = 0
+        var target = strideSamples
 
-        let silenceCandidate = try bestBoundaryCandidate(
-            targetFrame: targetFrame,
-            searchRadiusFrames: silenceSearchRadiusFrames,
-            previousStart: previousStart,
-            latestCoveredStart: latestCoveredStart,
-            halfEnergyWindowSamples: halfEnergyWindowSamples
-        )
-        let foundNearSilence = isNearSilenceBoundary(silenceCandidate)
+        while target < totalSamples {
+            let targetFrame = target / frameSamples
+            let latestCoveredStart = previousStart + chunkSamples - minimumOverlapSamples
+            let targetStart = min(max(targetFrame * frameSamples, previousStart + frameSamples), latestCoveredStart)
 
-        var bestStart: Int
-        var useWarmupPrefix = false
-        if foundNearSilence {
-            let shouldWarmup =
-                canUseWarmupPrefix ? (try shouldUseWarmupPrefix(at: silenceCandidate.start)) : false
-            let compressesSpeechTail: Bool
-            if shouldWarmup && silenceCandidate.start < targetStart {
-                compressesSpeechTail = try wouldCompressSpeechTail(
-                    candidateStart: silenceCandidate.start,
-                    targetStart: targetStart,
-                    chunkSamples: chunkSamples,
-                    minimumOverlapSamples: minimumOverlapSamples,
-                    medianScore: silenceCandidate.medianScore,
-                    halfEnergyWindowSamples: halfEnergyWindowSamples
-                )
-            } else {
-                compressesSpeechTail = false
-            }
-            if compressesSpeechTail {
-                bestStart = targetStart
-            } else {
-                bestStart = silenceCandidate.start
-                useWarmupPrefix = shouldWarmup
-            }
-        } else {
-            let valleyCandidate = try bestBoundaryCandidate(
+            let silenceCandidate = try bestBoundaryCandidate(
                 targetFrame: targetFrame,
-                searchRadiusFrames: valleySearchRadiusFrames,
+                searchRadiusFrames: silenceSearchRadiusFrames,
                 previousStart: previousStart,
                 latestCoveredStart: latestCoveredStart,
                 halfEnergyWindowSamples: halfEnergyWindowSamples
             )
-            bestStart = isUsableValleyBoundary(valleyCandidate) ? valleyCandidate.start : targetStart
+            let foundNearSilence = isNearSilenceBoundary(silenceCandidate)
+
+            var bestStart: Int
+            var useWarmupPrefix = false
+            if foundNearSilence {
+                let shouldWarmup =
+                    canUseWarmupPrefix ? (try shouldUseWarmupPrefix(at: silenceCandidate.start)) : false
+                let compressesSpeechTail: Bool
+                if shouldWarmup && silenceCandidate.start < targetStart {
+                    compressesSpeechTail = try wouldCompressSpeechTail(
+                        candidateStart: silenceCandidate.start,
+                        targetStart: targetStart,
+                        chunkSamples: chunkSamples,
+                        minimumOverlapSamples: minimumOverlapSamples,
+                        medianScore: silenceCandidate.medianScore,
+                        halfEnergyWindowSamples: halfEnergyWindowSamples
+                    )
+                } else {
+                    compressesSpeechTail = false
+                }
+                if compressesSpeechTail {
+                    bestStart = targetStart
+                } else {
+                    bestStart = silenceCandidate.start
+                    useWarmupPrefix = shouldWarmup
+                }
+            } else {
+                let valleyCandidate = try bestBoundaryCandidate(
+                    targetFrame: targetFrame,
+                    searchRadiusFrames: valleySearchRadiusFrames,
+                    previousStart: previousStart,
+                    latestCoveredStart: latestCoveredStart,
+                    halfEnergyWindowSamples: halfEnergyWindowSamples
+                )
+                bestStart = isUsableValleyBoundary(valleyCandidate) ? valleyCandidate.start : targetStart
+            }
+
+            if bestStart <= previousStart {
+                bestStart = min(previousStart + strideSamples, totalSamples)
+            }
+
+            starts.append(
+                ChunkStartDecision(
+                    start: bestStart,
+                    useWarmupPrefix: useWarmupPrefix
+                )
+            )
+            previousStart = bestStart
+            target += strideSamples
         }
 
-        if bestStart <= previousStart {
-            bestStart = min(previousStart + strideSamples, totalSamples)
-        }
-
-        return ChunkStartDecision(
-            start: bestStart,
-            useWarmupPrefix: useWarmupPrefix
-        )
+        return starts
     }
 
     private func bestBoundaryCandidate(
