@@ -33,11 +33,12 @@ public actor AsrManager {
         config.parallelChunkConcurrency
     }
 
-    /// Issue #594: opt-out flag exposed to `ChunkProcessor`. When `false`,
-    /// disables PR #264's 80ms mel-context prepend so v3 multilingual
-    /// long-form audio can use the no-mel boundary warmup path.
+    /// Resolved mel-context flag exposed to `ChunkProcessor`. When `false`,
+    /// disables PR #264's 80ms mel-context prepend so v3 long-form audio
+    /// uses the no-mel boundary warmup path with silence-aligned chunk
+    /// starts (issues #594, #803). Unset config resolves to `false` on v3.
     internal var melChunkContext: Bool {
-        config.melChunkContext
+        config.resolvedMelChunkContext(for: modelVersion)
     }
 
     /// Opt-in dual-decode arbitration flag exposed to `ChunkProcessor`.
@@ -58,10 +59,13 @@ public actor AsrManager {
 
     /// Cached vocabulary loaded once during initialization
     internal var vocabulary: [Int: String] = [:]
+    /// Sentence-final punctuation ids resolved from `vocabulary` (issue #905).
+    internal var punctuationTokenIds: Set<Int> = Set(ASRConstants.punctuationTokens)
     #if DEBUG
     // Test-only setter
     internal func setVocabularyForTesting(_ vocab: [Int: String]) {
         vocabulary = vocab
+        punctuationTokenIds = ASRConstants.punctuationTokenIds(in: vocab)
     }
     #endif
 
@@ -80,6 +84,7 @@ public actor AsrManager {
             self.decoderModel = models.decoder
             self.jointModel = models.joint
             self.vocabulary = models.vocabulary
+            self.punctuationTokenIds = ASRConstants.punctuationTokenIds(in: models.vocabulary)
         }
 
         // Pre-warm caches if possible
@@ -140,6 +145,7 @@ public actor AsrManager {
         self.decoderModel = models.decoder
         self.jointModel = models.joint
         self.vocabulary = models.vocabulary
+        self.punctuationTokenIds = ASRConstants.punctuationTokenIds(in: models.vocabulary)
 
         logger.info("AsrManager loaded successfully with provided models")
     }
@@ -261,7 +267,7 @@ public actor AsrManager {
                 parallelChunkConcurrency: workingConfig.parallelChunkConcurrency,
                 streamingEnabled: workingConfig.streamingEnabled,
                 streamingThreshold: workingConfig.streamingThreshold,
-                melChunkContext: workingConfig.melChunkContext,
+                melChunkContext: workingConfig.melChunkContextOverride,
                 dualDecodeArbitration: workingConfig.dualDecodeArbitration
             )
         }
@@ -276,7 +282,7 @@ public actor AsrManager {
                 parallelChunkConcurrency: workingConfig.parallelChunkConcurrency,
                 streamingEnabled: workingConfig.streamingEnabled,
                 streamingThreshold: workingConfig.streamingThreshold,
-                melChunkContext: workingConfig.melChunkContext,
+                melChunkContext: workingConfig.melChunkContextOverride,
                 dualDecodeArbitration: workingConfig.dualDecodeArbitration
             )
         } else {
@@ -301,6 +307,7 @@ public actor AsrManager {
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
                 globalFrameOffset: globalFrameOffset,
+                punctuationTokenIds: punctuationTokenIds,
                 emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
                 initialTimeIndexOverride: initialTimeIndexOverride
             )
@@ -321,6 +328,7 @@ public actor AsrManager {
                 globalFrameOffset: globalFrameOffset,
                 language: language,
                 vocabulary: vocabulary,
+                punctuationTokenIds: punctuationTokenIds,
                 emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
                 initialTimeIndexOverride: initialTimeIndexOverride
             )
@@ -346,6 +354,7 @@ public actor AsrManager {
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
                 globalFrameOffset: globalFrameOffset,
+                punctuationTokenIds: punctuationTokenIds,
                 emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
                 initialTimeIndexOverride: initialTimeIndexOverride
             )

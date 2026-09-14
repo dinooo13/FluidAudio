@@ -57,7 +57,9 @@ public struct KokoroAneComputeUnits: Sendable, Equatable {
     ///
     /// On OS 27+: identical to ``aneTailCpu`` — the GPU stages abort
     /// intermittently inside MPSGraph under CoreML on the 27 line (#843,
-    /// FB24243070), so noise + tail move to `.cpuOnly`.
+    /// FB24243070), so noise + tail move to `.cpuOnly`. That route is not
+    /// known to be safe either (#889); `KokoroAneManager.initialize()` logs
+    /// the advisory on the 27 line.
     public static var `default`: KokoroAneComputeUnits {
         defaultUnits(for: ProcessInfo.processInfo.operatingSystemVersion)
     }
@@ -111,13 +113,14 @@ public struct KokoroAneComputeUnits: Sendable, Equatable {
         tail: .cpuAndGPU
     )
 
-    /// OS 27 stability: like ``aneTailGpu`` but noise + tail on `.cpuOnly`,
+    /// OS 27 default: like ``aneTailGpu`` but noise + tail on `.cpuOnly`,
     /// so Metal is never invoked. On the 27 line the GPU stages abort
     /// intermittently inside MPSGraph under CoreML (uncatchable in-process
-    /// abort, #843, FB24243070); the BNNS iSTFT path they fall back to is
-    /// fine there — the libBNNS segfault is a 26.x-line bug (#817/#844).
-    /// Field-validated on iPadOS 27.0 with imperceptible perf cost for
-    /// speech-length inputs.
+    /// abort, #843, FB24243070). This route is the lesser evil, not a safe
+    /// one: on iOS 27.0 it has crashed in libBNNS (`vadd_fp16_sme_internal`
+    /// SIGSEGV, ~54 min into a session, #889), so the 26.x libBNNS class is
+    /// not confined to 26.x. Short-run field validation on iPadOS 27.0 showed
+    /// imperceptible perf cost; long sessions are the open risk.
     public static let aneTailCpu = KokoroAneComputeUnits(
         albert: .cpuAndNeuralEngine, postAlbert: .cpuAndNeuralEngine,
         alignment: .cpuAndNeuralEngine, prosody: .cpuAndNeuralEngine,
@@ -169,6 +172,7 @@ public actor KokoroAneModelStore {
     private var voicePacks: [String: KokoroAneVoicePack] = [:]
     private var repoDirectory: URL?
     private var mandarinG2P: MandarinG2P?
+    private var japaneseG2P: JapaneseG2P?
     private var mandarinCustomLexicon: MandarinCustomLexicon = .empty
 
     private let directory: URL?
@@ -328,6 +332,27 @@ public actor KokoroAneModelStore {
         return pipeline
     }
 
+    /// Lazy-load and cache the Japanese frontend (MeCab over the trimmed
+    /// unidic-lite dictionary + Cutlet rules). The asset download is
+    /// independent of the CoreML model download and occurs only when a caller
+    /// supplies plain Japanese text.
+    func japaneseG2PPipeline() async throws -> JapaneseG2P {
+        if let japaneseG2P { return japaneseG2P }
+        guard variant == .japanese else {
+            throw KokoroAneError.inputProcessingFailed(
+                "Japanese G2P requested on a non-japanese store")
+        }
+        let repoDirectory =
+            try repoDirectory
+            ?? KokoroAneResourceDownloader.repositoryDirectory(
+                variant: .japanese, directory: directory)
+        let g2pDirectory = try await KokoroAneResourceDownloader.ensureJapaneseG2P(repoDirectory: repoDirectory)
+        let pipeline = try JapaneseG2P(directory: g2pDirectory)
+        japaneseG2P = pipeline
+        logger.info("Loaded Japanese G2P (MeCab + Cutlet)")
+        return pipeline
+    }
+
     /// Best-effort load of the g2pW polyphone disambiguator. Returns
     /// `nil` (and logs) when the assets are missing or fail to load,
     /// so the Mandarin G2P pipeline can keep running on the dict
@@ -378,5 +403,6 @@ public actor KokoroAneModelStore {
         vocab = nil
         repoDirectory = nil
         mandarinG2P = nil
+        japaneseG2P = nil
     }
 }

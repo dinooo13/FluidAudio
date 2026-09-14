@@ -209,7 +209,7 @@ enum TranscribeCommand {
         var parakeetVariant: StreamingModelVariant?
         var language: Language?
         var encoderPrecision: ParakeetEncoderPrecision = .int8
-        var melChunkContext = true
+        var melChunkContext: Bool? = nil
         var dualDecodeArbitration = false
         var seamGapRepair = true
         var streamingMode = false
@@ -263,9 +263,12 @@ enum TranscribeCommand {
                         parsed.modelVersion = .v3
                     case "tdt-ctc-110m", "110m":
                         parsed.modelVersion = .tdtCtc110m
+                    case "tdt-ja", "ja":
+                        parsed.modelVersion = .tdtJa
                     default:
                         fputs(
-                            "ERROR: Invalid model version: \(args[i + 1]). Use 'v2', 'v3', or 'tdt-ctc-110m'\n", stderr)
+                            "ERROR: Invalid model version: \(args[i + 1]). Use 'v2', 'v3', 'tdt-ctc-110m', or 'tdt-ja'\n",
+                            stderr)
                         fflush(stderr)
                         return nil
                     }
@@ -316,6 +319,8 @@ enum TranscribeCommand {
                 }
             case "--no-mel-context":
                 parsed.melChunkContext = false
+            case "--mel-context":
+                parsed.melChunkContext = true
             case "--dual-decode-arbitration":
                 parsed.dualDecodeArbitration = true
             case "--no-seam-gap-repair":
@@ -509,21 +514,7 @@ enum TranscribeCommand {
                     let ctcModelDir = CtcModels.defaultCacheDirectory(for: ctcModels.variant)
 
                     let vocabConfig = ContextBiasingConstants.rescorerConfig(forVocabSize: customVocab.terms.count)
-                    // #702: opt-in short-term over-fire controls. Each flag
-                    // falls back to the library default (disabled) when unset.
-                    let rescorerConfig = VocabularyRescorer.Config(
-                        shortTermCbwTaperPivot: args.vocabShortTermTaperPivot
-                            ?? ContextBiasingConstants.defaultShortTermCbwTaperPivot,
-                        spotterRescueMinSimilarity: args.vocabSpotterMinSim
-                            ?? ContextBiasingConstants.defaultSpotterRescueMinSimilarity,
-                        spotterRescueMultiWordMinSimilarity: args.vocabSpotterMinSimMulti
-                            ?? ContextBiasingConstants.defaultSpotterRescueMultiWordMinSimilarity,
-                        // #724: `--vocab-disable-spotter-rescue` forces the acoustic
-                        // rescue pass off; otherwise follow the library/env default
-                        // (on unless `FLUID_SPOTTER_RESCUE` disables it).
-                        spotterRescueEnabled: args.vocabDisableSpotterRescue
-                            ? false : ContextBiasingConstants.defaultSpotterRescueEnabled
-                    )
+                    let rescorerConfig = makeRescorerConfig(args)
 
                     let rescorer = try await VocabularyRescorer.create(
                         spotter: spotter,
@@ -666,6 +657,22 @@ enum TranscribeCommand {
 
     // MARK: - Streaming Mode
 
+    /// #702/#724 opt-in over-fire controls, shared by batch and streaming. Each
+    /// flag falls back to the library default when unset; the library/env default
+    /// for the rescue pass is on unless `FLUID_SPOTTER_RESCUE` disables it.
+    private static func makeRescorerConfig(_ args: ParsedArgs) -> VocabularyRescorer.Config {
+        VocabularyRescorer.Config(
+            shortTermCbwTaperPivot: args.vocabShortTermTaperPivot
+                ?? ContextBiasingConstants.defaultShortTermCbwTaperPivot,
+            spotterRescueMinSimilarity: args.vocabSpotterMinSim
+                ?? ContextBiasingConstants.defaultSpotterRescueMinSimilarity,
+            spotterRescueMultiWordMinSimilarity: args.vocabSpotterMinSimMulti
+                ?? ContextBiasingConstants.defaultSpotterRescueMultiWordMinSimilarity,
+            spotterRescueEnabled: args.vocabDisableSpotterRescue
+                ? false : ContextBiasingConstants.defaultSpotterRescueEnabled
+        )
+    }
+
     private static func runStreaming(
         audioFile: String, args: ParsedArgs
     ) async {
@@ -698,9 +705,12 @@ enum TranscribeCommand {
                 let (customVocab, ctcModels) = try await CustomVocabularyContext.loadWithCtcTokens(from: vocabPath)
                 logger.info("Loaded \(customVocab.terms.count) vocabulary terms for streaming")
 
+                // Same #702/#724 over-fire flags as batch mode (#899: streaming
+                // previously dropped them and always ran the library default).
                 try await streamingAsr.configureVocabularyBoosting(
                     vocabulary: customVocab,
-                    ctcModels: ctcModels
+                    ctcModels: ctcModels,
+                    config: makeRescorerConfig(args)
                 )
             }
 
@@ -1021,10 +1031,13 @@ enum TranscribeCommand {
                 --output-json <file>           Save full transcription to JSON
                 --model-version <v2|v3|110m>   ASR model version (default: v3)
                 --model-dir <path>             Local model directory (skips download)
-                --encoder-precision <int8|int4> Encoder quantization (default: int8)
+                --encoder-precision <int8|int8-v2|int4> Encoder quantization (default: int8;
+                                               int8-v2 = int8-linear rebuild, avoids #760)
                 --language <code>              Language hint (e.g., en, de, fr, es)
                 --custom-vocab <file>          Apply vocabulary boosting in batch mode
                 --no-mel-context               Disable 80ms mel-context prepend for long-form batch ASR
+                                               (default: disabled on v3, enabled otherwise)
+                --mel-context                  Force-enable the mel-context prepend (v3 opt-in)
                 --dual-decode-arbitration      Enable v3/no-mel long-form boundary arbitration
 
             STREAMING MODE OPTIONS (--streaming, SlidingWindowAsrManager):

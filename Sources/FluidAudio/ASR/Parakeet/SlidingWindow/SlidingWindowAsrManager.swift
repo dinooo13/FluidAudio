@@ -35,6 +35,11 @@ public actor SlidingWindowAsrManager {
     // accumulatedTokens). Lets per-chunk dedup require temporal adjacency so a
     // coincidental subword-prefix match between far-apart words isn't dropped (#787).
     private var accumulatedTokenTimestamps: [Int] = []
+    /// The previous window's last word as it was appended to the transcript
+    /// text — the vocabulary replacement when rescoring replaced it — so seam
+    /// retirement can remove it even when it no longer equals the raw token
+    /// text (#897).
+    private var lastWindowRenderedLastWord: String?
 
     // Raw sample buffer for sliding-window assembly (absolute indexing)
     private var sampleBuffer: [Float] = []
@@ -61,7 +66,8 @@ public actor SlidingWindowAsrManager {
 
     // Vocabulary boosting
     // Initialized via configureVocabularyBoosting() before start()
-    private var vocabularyBoosting: VocabularyBoostingSession?
+    // Internal (not private) so tests can inspect the configured vocabulary.
+    var vocabularyBoosting: VocabularyBoostingSession?
     private var vocabBoostingEnabled: Bool { vocabularyBoosting != nil }
 
     /// Initialize the sliding-window ASR manager
@@ -81,8 +87,10 @@ public actor SlidingWindowAsrManager {
 
     /// Configure vocabulary boosting for streaming transcription
     ///
-    /// When configured, vocabulary terms will be rescored when text is confirmed during streaming.
-    /// This provides real-time vocabulary corrections visible in confirmed updates.
+    /// When configured, every window is rescored against CTC evidence as it is
+    /// decoded — confirmed or not (#851) — so corrections appear in both volatile
+    /// and confirmed updates and in `finish()`. Terms without `ctcTokenIds` are
+    /// tokenized here with the CTC tokenizer.
     ///
     /// - Parameters:
     ///   - vocabulary: Custom vocabulary context with terms to detect
@@ -166,6 +174,7 @@ public actor SlidingWindowAsrManager {
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
         accumulatedTokenTimestamps.removeAll()
+        lastWindowRenderedLastWord = nil
         failedWindowCount = 0
         lastWindowError = nil
 
@@ -301,6 +310,7 @@ public actor SlidingWindowAsrManager {
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
         accumulatedTokenTimestamps.removeAll()
+        lastWindowRenderedLastWord = nil
 
         logger.info("SlidingWindowAsrManager reset for source: \(String(describing: self.audioSource))")
     }
@@ -357,8 +367,9 @@ public actor SlidingWindowAsrManager {
             // Advance by chunk size
             nextWindowCenterStart += chunk
 
-            // Trim buffer to keep only what's needed for left context
-            let trimToAbs = max(0, nextWindowCenterStart - left)
+            // Keep a full chunk plus the left context behind the next center so a
+            // short final flush window can be end-aligned (see `flushRemaining`).
+            let trimToAbs = max(0, nextWindowCenterStart - left - chunk)
             let dropCount = max(0, trimToAbs - bufferStartIndex)
             if dropCount > 0 && dropCount <= sampleBuffer.count {
                 sampleBuffer.removeFirst(dropCount)
@@ -382,14 +393,21 @@ public actor SlidingWindowAsrManager {
             if availableAhead <= 0 { break }
             let effectiveChunk = min(chunk, availableAhead)
 
-            let leftStartAbs = max(0, nextWindowCenterStart - left)
             let rightEndAbs = nextWindowCenterStart + effectiveChunk
+            let isLastWindow = rightEndAbs >= currentAbsEnd
+            // End-align a short final window: a fresh decoder state needs more
+            // than a couple of seconds of audio to emit anything, and the
+            // re-decode cutoff suppresses what previous windows already emitted.
+            let leftStartAbs =
+                isLastWindow
+                ? Self.finalWindowStart(
+                    nextCenterStart: nextWindowCenterStart, effectiveChunk: effectiveChunk, chunk: chunk, left: left)
+                : max(0, nextWindowCenterStart - left)
             let startIdx = max(leftStartAbs - bufferStartIndex, 0)
             let endIdx = max(rightEndAbs - bufferStartIndex, startIdx)
             if startIdx < 0 || endIdx > sampleBuffer.count || startIdx >= endIdx { break }
 
             let window = Array(sampleBuffer[startIdx..<endIdx])
-            let isLastWindow = (nextWindowCenterStart + effectiveChunk) >= currentAbsEnd
             await processWindow(
                 window,
                 windowStartSample: leftStartAbs,
@@ -399,7 +417,7 @@ public actor SlidingWindowAsrManager {
             nextWindowCenterStart += effectiveChunk
 
             // Trim
-            let trimToAbs = max(0, nextWindowCenterStart - left)
+            let trimToAbs = max(0, nextWindowCenterStart - left - chunk)
             let dropCount = max(0, trimToAbs - bufferStartIndex)
             if dropCount > 0 && dropCount <= sampleBuffer.count {
                 sampleBuffer.removeFirst(dropCount)
@@ -442,7 +460,30 @@ public actor SlidingWindowAsrManager {
             // Update stored decoder state
             self.decoderState = state
 
-            let (tokens, timestamps, confidences, _) = result
+            let (tokens, timestamps, confidences, _, droppedPreviousTokens) = result
+
+            // The window re-decoded the previous window's last word in full (#897):
+            // retire that word from the accumulated tokens and from the text state.
+            if droppedPreviousTokens > 0, droppedPreviousTokens < accumulatedTokens.count {
+                let dropped = Array(accumulatedTokens.suffix(droppedPreviousTokens))
+                accumulatedTokens.removeLast(droppedPreviousTokens)
+                accumulatedTokenTimestamps.removeLast(min(droppedPreviousTokens, accumulatedTokenTimestamps.count))
+                if let droppedText = await asrManager?.convertTokensToText(dropped), !droppedText.isEmpty {
+                    // The text state may hold a vocabulary-rescored replacement
+                    // for that word rather than its raw token text.
+                    let candidates = [droppedText] + (lastWindowRenderedLastWord.map { [$0] } ?? [])
+                    for candidate in candidates {
+                        if let trimmed = Self.removingTrailingWord(candidate, from: volatileTranscript) {
+                            volatileTranscript = trimmed
+                            break
+                        }
+                        if let trimmed = Self.removingTrailingWord(candidate, from: confirmedTranscript) {
+                            confirmedTranscript = trimmed
+                            break
+                        }
+                    }
+                }
+            }
 
             let adjustedTimestamps = Self.applyGlobalFrameOffset(
                 to: timestamps,
@@ -491,9 +532,14 @@ public actor SlidingWindowAsrManager {
             let isHighConfidence = Double(interim.confidence) >= config.confirmationThreshold
             let shouldConfirm = isHighConfidence && hasMinimumContext
 
-            // Rescore before updating transcript state so finish() returns rescored content
+            // Rescore before updating transcript state so finish() returns rescored content.
+            // Every window is rescored, not only confirmed ones: confirmation is a display
+            // promotion, but a window's text is promoted verbatim later, so a window that
+            // was volatile when decoded (short clip under `minContextForConfirmation`, low
+            // confidence, the final flush) would otherwise never see its vocabulary (#851).
             var displayResult = interim
-            if shouldConfirm && vocabBoostingEnabled,
+            var appliedReplacements: [VocabularyRescorer.RescoringResult] = []
+            if vocabBoostingEnabled,
                 let chunkLocalResult = await asrManager?.processTranscriptionResult(
                     tokenIds: tokens,
                     timestamps: timestamps,  // Original chunk-local timestamps (not adjusted)
@@ -505,24 +551,26 @@ public actor SlidingWindowAsrManager {
             {
                 let chunkLocalTimings = chunkLocalResult.tokenTimings ?? []
 
-                if let rescored = await applyVocabularyRescoring(
+                // Rescoring ran for this window: report its detections even when
+                // there are none, so `ctcDetectedTerms` is nil only when boosting
+                // is not configured (a deterministic "rescored" signal, #899).
+                let rescored = await applyVocabularyRescoring(
                     text: interim.text,
                     tokenTimings: chunkLocalTimings,
                     windowSamples: windowSamples
-                ) {
-                    let detected = rescored.replacements.compactMap { $0.replacementWord }
-                    let applied = rescored.replacements.filter { $0.shouldReplace }.compactMap {
-                        $0.replacementWord
-                    }
-                    displayResult = interim.withRescoring(
-                        text: rescored.text,
-                        detected: detected.isEmpty ? nil : detected,
-                        applied: applied.isEmpty ? nil : applied
-                    )
-                }
+                )
+                appliedReplacements = (rescored?.replacements ?? []).filter { $0.shouldReplace }
+                let applied = appliedReplacements.compactMap { $0.replacementWord }
+                displayResult = interim.withRescoring(
+                    text: rescored?.text ?? interim.text,
+                    detected: rescored?.detectedTerms ?? [],
+                    applied: applied.isEmpty ? nil : applied
+                )
             }
 
             await updateTranscriptionState(with: displayResult, shouldConfirm: shouldConfirm)
+            lastWindowRenderedLastWord = Self.renderedLastWord(
+                rawText: interim.text, renderedText: displayResult.text, replacements: appliedReplacements)
 
             let update = SlidingWindowTranscriptionUpdate(
                 text: displayResult.text,
@@ -530,7 +578,9 @@ public actor SlidingWindowAsrManager {
                 confidence: interim.confidence,
                 timestamp: Date(),
                 tokenIds: tokens,
-                tokenTimings: displayResult.tokenTimings ?? []
+                tokenTimings: displayResult.tokenTimings ?? [],
+                ctcDetectedTerms: displayResult.ctcDetectedTerms,
+                ctcAppliedTerms: displayResult.ctcAppliedTerms
             )
 
             updateContinuation?.yield(update)
@@ -568,7 +618,12 @@ public actor SlidingWindowAsrManager {
                 "CONFIRMED (\(result.confidence), \(String(format: "%.1f", totalAudioProcessed))s context): promoted to confirmed; new volatile '\(result.text)'"
             )
         } else {
-            volatileTranscript = result.text
+            // Each window carries new audio, so an unconfirmed window extends the
+            // volatile tail rather than replacing it. Overwriting lost the previous
+            // window's text whenever two consecutive windows went unconfirmed — with
+            // boosting on, finish() builds from this text, and a trailing empty flush
+            // window returned an empty transcript for a 15 s clip (#851).
+            volatileTranscript = Self.appendingVolatile(volatileTranscript, result.text)
             let hasMinimumContext = totalAudioProcessed >= config.minContextForConfirmation
             let reason =
                 !hasMinimumContext
@@ -577,7 +632,50 @@ public actor SlidingWindowAsrManager {
         }
     }
 
-    /// Apply vocabulary rescoring to confirmed text using CTC-based constrained decoding.
+    /// Start sample of the final flush window: end-aligned so the window spans a
+    /// full chunk plus the left context even when little new audio remains
+    /// (#897). A 2–3 s window decoded from a fresh state emits nothing and the
+    /// last words are lost; the re-decode cutoff makes the longer window safe.
+    /// Never later than the regular `center - left` start. Pure.
+    static func finalWindowStart(nextCenterStart: Int, effectiveChunk: Int, chunk: Int, left: Int) -> Int {
+        let regular = max(0, nextCenterStart - left)
+        let endAligned = max(0, nextCenterStart + effectiveChunk - chunk - left)
+        return min(regular, endAligned)
+    }
+
+    /// The form in which a window's last word reached the transcript text: the
+    /// vocabulary replacement when rescoring replaced that word (possibly a
+    /// multi-word term), otherwise the last word of the rendered text. Pure.
+    static func renderedLastWord(
+        rawText: String, renderedText: String, replacements: [VocabularyRescorer.RescoringResult]
+    ) -> String? {
+        func core(_ word: String) -> String {
+            word.lowercased().trimmingCharacters(in: .punctuationCharacters.union(.whitespaces))
+        }
+        guard let rawLast = rawText.split(separator: " ").last.map(String.init) else { return nil }
+        if let hit = replacements.last(where: { $0.shouldReplace && core($0.originalWord) == core(rawLast) }),
+            let replacement = hit.replacementWord, !replacement.isEmpty
+        {
+            return replacement
+        }
+        return renderedText.split(separator: " ").last.map(String.init)
+    }
+
+    /// `text` without its trailing `word` when `text` ends with that word as a
+    /// whole word (equal, or preceded by a space); nil otherwise. Pure.
+    static func removingTrailingWord(_ word: String, from text: String) -> String? {
+        if text == word { return "" }
+        guard text.hasSuffix(" " + word) else { return nil }
+        return String(text.dropLast(word.count + 1))
+    }
+
+    /// Join the still-volatile text with a newer unconfirmed window's text.
+    /// Empty pieces (a silent flush window) contribute nothing. Pure, for testability.
+    static func appendingVolatile(_ existing: String, _ incoming: String) -> String {
+        [existing, incoming].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// Apply vocabulary rescoring to a window's text using CTC-based constrained decoding.
     ///
     /// This runs CTC inference on the chunk audio and applies vocabulary rescoring
     /// to replace misrecognized words with vocabulary terms when acoustic evidence supports it.
@@ -854,13 +952,23 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         tokenTimings.map(\.token)
     }
 
+    /// Vocabulary terms the CTC spotter detected in this window's audio (#899).
+    /// `nil` when vocabulary boosting is not configured; empty when rescoring
+    /// ran on this window and detected nothing. Present even if nothing was
+    /// replaced.
+    public let ctcDetectedTerms: [String]?
+    /// Vocabulary terms applied as replacements in this window's text.
+    public let ctcAppliedTerms: [String]?
+
     public init(
         text: String,
         isConfirmed: Bool,
         confidence: Float,
         timestamp: Date,
         tokenIds: [Int] = [],
-        tokenTimings: [TokenTiming] = []
+        tokenTimings: [TokenTiming] = [],
+        ctcDetectedTerms: [String]? = nil,
+        ctcAppliedTerms: [String]? = nil
     ) {
         self.text = text
         self.isConfirmed = isConfirmed
@@ -868,5 +976,7 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         self.timestamp = timestamp
         self.tokenIds = tokenIds
         self.tokenTimings = tokenTimings
+        self.ctcDetectedTerms = ctcDetectedTerms
+        self.ctcAppliedTerms = ctcAppliedTerms
     }
 }
