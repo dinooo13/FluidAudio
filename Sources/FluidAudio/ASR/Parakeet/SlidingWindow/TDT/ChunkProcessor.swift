@@ -184,62 +184,26 @@ struct ChunkProcessor {
         var chunkIndex = 0
 
         while chunkStart < totalSamples {
-            let defaultWarmupSamples =
-                chunkIndex > 0 && decision.useWarmupPrefix
-                ? min(warmupPrefixSamples, chunkStart) : 0
-            // A short final chunk fills its window backwards with real
-            // audio instead of zero padding (issue #747); V2-family
-            // decoders can't suppress the prefix and keep the old layout.
-            let warmupSamples =
-                endAligned
-                ? lastChunkWarmupSamples(
-                    chunkStart: chunkStart,
-                    defaultWarmupSamples: defaultWarmupSamples,
-                    chunkSamples: chunkSamples,
-                    totalSamples: totalSamples,
-                    speechEndSamples: speechEnd)
-                : defaultWarmupSamples
-            let visibleChunkSamples = max(
-                ASRConstants.samplesPerEncoderFrame,
-                chunkSamples - warmupSamples
-            )
-            let candidateEnd = chunkStart + visibleChunkSamples
-            let isLastChunk = candidateEnd >= totalSamples
-            let chunkEnd = isLastChunk ? totalSamples : candidateEnd
-
-            if chunkEnd <= chunkStart {
-                break
-            }
-            // The final window's audio stops at the last speech-bearing
-            // frame — a window ending inside a dead-silence run decodes
-            // degenerately. A pure-silence tail has nothing to decode.
-            var audioEnd = isLastChunk && endAligned ? min(chunkEnd, speechEnd) : chunkEnd
-            if pauseCutWindows, !isLastChunk, chunkIndex + 1 < chunkStarts.count,
-                chunkStarts[chunkIndex + 1].pauseCut
-            {
-                audioEnd = min(audioEnd, chunkStarts[chunkIndex + 1].start)
-            }
-            if audioEnd <= chunkStart {
-                break
-            }
-
-            // In the default path, contextSamples means mel/STFT context
-            // and is skipped by the decoder. In v3/no-mel mode, the
-            // warmup prefix is decoded from frame 0 and only its emitted
-            // tokens are suppressed.
-            let contextSamples = warmupSamples > 0 ? 0 : (chunkIndex > 0 ? melContextSamples : 0)
-            plan.append(
-                PlannedWindow(
+            let nextIndex = chunkIndex + 1
+            let pauseCutEnd =
+                pauseCutWindows && nextIndex < chunkStarts.count && chunkStarts[nextIndex].pauseCut
+                ? chunkStarts[nextIndex].start : nil
+            guard
+                let window = planWindow(
                     index: chunkIndex,
-                    start: chunkStart,
-                    warmupSamples: warmupSamples,
-                    contextSamples: contextSamples,
-                    chunkEnd: chunkEnd,
-                    audioEnd: audioEnd,
-                    isLastChunk: isLastChunk))
+                    decision: decision,
+                    pauseCutEnd: pauseCutEnd,
+                    chunkSamples: chunkSamples,
+                    warmupPrefixSamples: warmupPrefixSamples,
+                    melContextSamples: melContextSamples,
+                    totalSamples: totalSamples,
+                    speechEnd: speechEnd,
+                    endAligned: endAligned)
+            else { break }
+            plan.append(window)
             chunkIndex += 1
 
-            if isLastChunk {
+            if window.isLastChunk {
                 break
             }
             if chunkIndex < chunkStarts.count {
@@ -251,6 +215,73 @@ struct ChunkProcessor {
             }
         }
         return plan
+    }
+
+    /// One window of `planWindows`, for a caller that decides starts one at a
+    /// time. `nil` exactly where `planWindows` stops. `pauseCutEnd` is the
+    /// next window's start when that start is a pause cut.
+    static func planWindow(
+        index chunkIndex: Int,
+        decision: ChunkStartDecision,
+        pauseCutEnd: Int?,
+        chunkSamples: Int,
+        warmupPrefixSamples: Int,
+        melContextSamples: Int,
+        totalSamples: Int,
+        speechEnd: Int,
+        endAligned: Bool
+    ) -> PlannedWindow? {
+        let chunkStart = decision.start
+        let defaultWarmupSamples =
+            chunkIndex > 0 && decision.useWarmupPrefix
+            ? min(warmupPrefixSamples, chunkStart) : 0
+        // A short final chunk fills its window backwards with real
+        // audio instead of zero padding (issue #747); V2-family
+        // decoders can't suppress the prefix and keep the old layout.
+        let warmupSamples =
+            endAligned
+            ? lastChunkWarmupSamples(
+                chunkStart: chunkStart,
+                defaultWarmupSamples: defaultWarmupSamples,
+                chunkSamples: chunkSamples,
+                totalSamples: totalSamples,
+                speechEndSamples: speechEnd)
+            : defaultWarmupSamples
+        let visibleChunkSamples = max(
+            ASRConstants.samplesPerEncoderFrame,
+            chunkSamples - warmupSamples
+        )
+        let candidateEnd = chunkStart + visibleChunkSamples
+        let isLastChunk = candidateEnd >= totalSamples
+        let chunkEnd = isLastChunk ? totalSamples : candidateEnd
+
+        if chunkEnd <= chunkStart {
+            return nil
+        }
+        // The final window's audio stops at the last speech-bearing
+        // frame — a window ending inside a dead-silence run decodes
+        // degenerately. A pure-silence tail has nothing to decode.
+        var audioEnd = isLastChunk && endAligned ? min(chunkEnd, speechEnd) : chunkEnd
+        if let pauseCutEnd, !isLastChunk {
+            audioEnd = min(audioEnd, pauseCutEnd)
+        }
+        if audioEnd <= chunkStart {
+            return nil
+        }
+
+        // In the default path, contextSamples means mel/STFT context
+        // and is skipped by the decoder. In v3/no-mel mode, the
+        // warmup prefix is decoded from frame 0 and only its emitted
+        // tokens are suppressed.
+        let contextSamples = warmupSamples > 0 ? 0 : (chunkIndex > 0 ? melContextSamples : 0)
+        return PlannedWindow(
+            index: chunkIndex,
+            start: chunkStart,
+            warmupSamples: warmupSamples,
+            contextSamples: contextSamples,
+            chunkEnd: chunkEnd,
+            audioEnd: audioEnd,
+            isLastChunk: isLastChunk)
     }
 
     /// Last speech-bearing sample of the recording: `totalSamples` minus
@@ -427,12 +458,6 @@ struct ChunkProcessor {
         canUseWarmupPrefix: Bool,
         preferLatePause: Bool = false
     ) throws -> [ChunkStartDecision] {
-        let frameSamples = ASRConstants.samplesPerEncoderFrame
-        let silenceSearchRadiusFrames = max(1, Int((4.0 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
-        let valleySearchRadiusFrames = max(1, Int((0.5 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
-        let halfEnergyWindowSamples = frameSamples
-        let minimumOverlapSamples = frameSamples * 6
-
         var starts = [ChunkStartDecision(start: 0, useWarmupPrefix: false)]
         var previousStart = 0
         var target = strideSamples
@@ -448,73 +473,98 @@ struct ChunkProcessor {
                 target = cut + strideSamples
                 continue
             }
-            let targetFrame = target / frameSamples
-            let latestCoveredStart = previousStart + chunkSamples - minimumOverlapSamples
-            let targetStart = min(max(targetFrame * frameSamples, previousStart + frameSamples), latestCoveredStart)
-
-            let silenceCandidate = try bestBoundaryCandidate(
-                targetFrame: targetFrame,
-                searchRadiusFrames: silenceSearchRadiusFrames,
-                previousStart: previousStart,
-                latestCoveredStart: latestCoveredStart,
-                halfEnergyWindowSamples: halfEnergyWindowSamples
+            let decision = try nextSilenceAlignedStart(
+                after: previousStart,
+                target: target,
+                chunkSamples: chunkSamples,
+                strideSamples: strideSamples,
+                canUseWarmupPrefix: canUseWarmupPrefix
             )
-            let foundNearSilence = isNearSilenceBoundary(silenceCandidate)
-
-            var bestStart: Int
-            var useWarmupPrefix = false
-            var pauseCut = false
-            if foundNearSilence {
-                let shouldWarmup =
-                    canUseWarmupPrefix ? (try shouldUseWarmupPrefix(at: silenceCandidate.start)) : false
-                let compressesSpeechTail: Bool
-                if shouldWarmup && silenceCandidate.start < targetStart {
-                    compressesSpeechTail = try wouldCompressSpeechTail(
-                        candidateStart: silenceCandidate.start,
-                        targetStart: targetStart,
-                        chunkSamples: chunkSamples,
-                        minimumOverlapSamples: minimumOverlapSamples,
-                        medianScore: silenceCandidate.medianScore,
-                        halfEnergyWindowSamples: halfEnergyWindowSamples
-                    )
-                } else {
-                    compressesSpeechTail = false
-                }
-                if compressesSpeechTail {
-                    bestStart = targetStart
-                } else {
-                    bestStart = silenceCandidate.start
-                    useWarmupPrefix = shouldWarmup
-                    pauseCut = true
-                }
-            } else {
-                let valleyCandidate = try bestBoundaryCandidate(
-                    targetFrame: targetFrame,
-                    searchRadiusFrames: valleySearchRadiusFrames,
-                    previousStart: previousStart,
-                    latestCoveredStart: latestCoveredStart,
-                    halfEnergyWindowSamples: halfEnergyWindowSamples
-                )
-                bestStart = isUsableValleyBoundary(valleyCandidate) ? valleyCandidate.start : targetStart
-            }
-
-            if bestStart <= previousStart {
-                bestStart = min(previousStart + strideSamples, totalSamples)
-                pauseCut = false
-            }
-
-            starts.append(
-                ChunkStartDecision(
-                    start: bestStart,
-                    useWarmupPrefix: useWarmupPrefix,
-                    pauseCut: pauseCut
-                )
-            )
-            previousStart = bestStart
+            starts.append(decision)
+            previousStart = decision.start
             target += strideSamples
         }
 
         return starts
+    }
+
+    /// One overlap-rule step of `silenceAlignedChunkStarts`: the start of the
+    /// window whose nominal position is `target`. Reads no sample above
+    /// `previousStart + chunkSamples - minimumOverlapSamples + frameSamples`,
+    /// so a caller holding that much audio gets the start `process` would pick.
+    func nextSilenceAlignedStart(
+        after previousStart: Int,
+        target: Int,
+        chunkSamples: Int,
+        strideSamples: Int,
+        canUseWarmupPrefix: Bool
+    ) throws -> ChunkStartDecision {
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let silenceSearchRadiusFrames = max(1, Int((4.0 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
+        let valleySearchRadiusFrames = max(1, Int((0.5 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
+        let halfEnergyWindowSamples = frameSamples
+        let minimumOverlapSamples = frameSamples * 6
+
+        let targetFrame = target / frameSamples
+        let latestCoveredStart = previousStart + chunkSamples - minimumOverlapSamples
+        let targetStart = min(max(targetFrame * frameSamples, previousStart + frameSamples), latestCoveredStart)
+
+        let silenceCandidate = try bestBoundaryCandidate(
+            targetFrame: targetFrame,
+            searchRadiusFrames: silenceSearchRadiusFrames,
+            previousStart: previousStart,
+            latestCoveredStart: latestCoveredStart,
+            halfEnergyWindowSamples: halfEnergyWindowSamples
+        )
+        let foundNearSilence = isNearSilenceBoundary(silenceCandidate)
+
+        var bestStart: Int
+        var useWarmupPrefix = false
+        var pauseCut = false
+        if foundNearSilence {
+            let shouldWarmup =
+                canUseWarmupPrefix ? (try shouldUseWarmupPrefix(at: silenceCandidate.start)) : false
+            let compressesSpeechTail: Bool
+            if shouldWarmup && silenceCandidate.start < targetStart {
+                compressesSpeechTail = try wouldCompressSpeechTail(
+                    candidateStart: silenceCandidate.start,
+                    targetStart: targetStart,
+                    chunkSamples: chunkSamples,
+                    minimumOverlapSamples: minimumOverlapSamples,
+                    medianScore: silenceCandidate.medianScore,
+                    halfEnergyWindowSamples: halfEnergyWindowSamples
+                )
+            } else {
+                compressesSpeechTail = false
+            }
+            if compressesSpeechTail {
+                bestStart = targetStart
+            } else {
+                bestStart = silenceCandidate.start
+                useWarmupPrefix = shouldWarmup
+                pauseCut = true
+            }
+        } else {
+            let valleyCandidate = try bestBoundaryCandidate(
+                targetFrame: targetFrame,
+                searchRadiusFrames: valleySearchRadiusFrames,
+                previousStart: previousStart,
+                latestCoveredStart: latestCoveredStart,
+                halfEnergyWindowSamples: halfEnergyWindowSamples
+            )
+            bestStart = isUsableValleyBoundary(valleyCandidate) ? valleyCandidate.start : targetStart
+        }
+
+        if bestStart <= previousStart {
+            bestStart = min(previousStart + strideSamples, totalSamples)
+            pauseCut = false
+        }
+
+        return ChunkStartDecision(
+            start: bestStart,
+            useWarmupPrefix: useWarmupPrefix,
+            pauseCut: pauseCut
+        )
     }
 
     private func bestBoundaryCandidate(
@@ -805,7 +855,6 @@ struct ChunkProcessor {
         // Each chunk's window in global frames, kept in step with
         // `chunkOutputs` for the seam timing rule in the merge.
         let chunkWindows = plan.map(\.frames)
-        let seamTimingRealignment = await manager.seamTimingRealignment
         var availableWorkers = Array(workers.indices)
         var inFlight = 0
 
@@ -899,6 +948,34 @@ struct ChunkProcessor {
         // Every slot is filled once the group has drained, so the outputs
         // and `chunkWindows` share their indices.
         let orderedChunkOutputs = chunkOutputs.compactMap { $0 }
+
+        return try await finalize(
+            chunkOutputs: orderedChunkOutputs,
+            chunkWindows: chunkWindows,
+            using: manager,
+            workers: workers,
+            decoderLayers: decoderLayers,
+            maxModelSamples: maxModelSamples,
+            language: language,
+            startTime: startTime
+        )
+    }
+
+    /// Everything `process` does once every window has returned: the merge,
+    /// the timestamp clamp, the seam duplicate collapse and the seam-gap
+    /// repair. Windows handed over in the same order give the same text.
+    func finalize(
+        chunkOutputs orderedChunkOutputs: [[TokenWindow]],
+        chunkWindows: [WindowFrames],
+        using manager: AsrManager,
+        workers: [AsrManager],
+        decoderLayers: Int,
+        maxModelSamples: Int,
+        language: Language?,
+        startTime: Date
+    ) async throws -> ASRResult {
+        let modelVersion = await manager.modelVersion
+        let seamTimingRealignment = await manager.seamTimingRealignment
 
         guard var mergedTokens = orderedChunkOutputs.first else {
             return await manager.processTranscriptionResult(
